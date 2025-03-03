@@ -5,38 +5,45 @@ import re
 import json
 import time
 import base64
+import os
+import subprocess
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
 # Configure page settings
 st.set_page_config(
-    page_title="YouTube Comments Downloader",
+    page_title="YouTube Downloader",
     page_icon="💬",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        'About': "# YouTube Comments Downloader\nDownload all comments from multiple YouTube videos."
+        'About': "# YouTube Downloader\nDownload comments and transcripts from multiple YouTube videos."
     }
 )
 
 # Load API keys from st.secrets if available
 @st.cache_resource
 def get_api_keys():
-    config = {"youtube_api_key": None}
+    config = {"youtube_api_key": None, "openai_api_key": None}
     try:
         if "YOUTUBE_API_KEY" in st.secrets:
             config["youtube_api_key"] = st.secrets["YOUTUBE_API_KEY"]
+        if "OPENAI_API_KEY" in st.secrets:
+            config["openai_api_key"] = st.secrets["OPENAI_API_KEY"]
     except Exception:
         pass
     return config
 
 api_keys = get_api_keys()
 YOUTUBE_API_KEY = api_keys["youtube_api_key"]
+OPENAI_API_KEY = api_keys["openai_api_key"]
 
-# Verify that API key exists
-if not YOUTUBE_API_KEY:
-    st.error("⚠️ YouTube API key not found in secrets. Please add it to your .streamlit/secrets.toml file.")
-    st.stop()
+# Create downloads directory if it doesn't exist
+os.makedirs("downloads", exist_ok=True)
 
 # Apply custom CSS for dark mode and modern UI
 st.markdown("""
@@ -99,7 +106,8 @@ st.markdown("""
 
 # Helper function to remove invalid filename characters
 def clean_filename(filename: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", filename)
+    cleaned = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    return cleaned.strip('. ')[:100]
 
 # Helper function: extract video ID from a YouTube URL
 def extract_video_id(url: str) -> Optional[str]:
@@ -113,6 +121,14 @@ def extract_video_id(url: str) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+# Helper function: get binary file download link
+def get_binary_file_downloader_html(bin_file, file_label='File'):
+    """Generate a link to download a binary file."""
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    bin_str = base64.b64encode(data).decode()
+    return f'<a href="data:application/octet-stream;base64,{bin_str}" download="{os.path.basename(bin_file)}" class="download-button">{file_label}</a>'
 
 # Helper function: fetch comments for a video using the YouTube Data API v3
 def get_comments(video_id: str, api_key: str, page_token: Optional[str] = None) -> Dict:
@@ -243,48 +259,252 @@ def create_download_link(df: pd.DataFrame, filename: str, link_text: str) -> str
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" class="download-button">{link_text}</a>'
     return href
 
+# Function to download audio from a YouTube video
+def download_youtube_audio(youtube_url, output_path="./downloads", format="mp3", quality="192"):
+    """Download audio from a YouTube video using yt-dlp."""
+    try:
+        video_id = extract_video_id(youtube_url)
+        if not video_id:
+            return {"success": False, "error": "Could not extract video ID from URL"}
+            
+        video_info = get_video_info(video_id, YOUTUBE_API_KEY)
+        if not video_info["success"]:
+            return video_info
+            
+        title = video_info["title"]
+        base_filename = clean_filename(title)
+        output_file = f"{output_path}/{base_filename}.{format}"
+        
+        command = [
+            "yt-dlp", "-f", "bestaudio",
+            "--extract-audio", "--audio-format", format,
+            "--audio-quality", quality,
+            "-o", output_file,
+            "--no-playlist", "--quiet", "--progress",
+            youtube_url
+        ]
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        status_text.text("Downloading audio...")
+        
+        process = subprocess.run(command, capture_output=True, text=True)
+        
+        if process.returncode != 0:
+            return {"success": False, "error": process.stderr}
+            
+        progress_bar.progress(100)
+        status_text.empty()
+        
+        if not os.path.exists(output_file):
+            potential_files = list(Path(output_path).glob(f"{base_filename}.*"))
+            if potential_files:
+                output_file = str(potential_files[0])
+            else:
+                return {"success": False, "error": "File not found after download"}
+                
+        return {
+            "success": True,
+            "file_path": output_file,
+            "title": title,
+            "file_name": os.path.basename(output_file)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Function to transcribe audio using OpenAI's Whisper
+def transcribe_with_whisper(audio_file_path, api_key):
+    """Convert audio to text using OpenAI's Whisper API."""
+    try:
+        import openai
+        openai.api_key = api_key
+        
+        with open(audio_file_path, "rb") as audio_file:
+            transcript_response = openai.Audio.transcribe("whisper-1", audio_file)
+            
+        transcript_text = transcript_response.get("text", "")
+        return {"success": True, "transcript": transcript_text}
+    except Exception as e:
+        return {"success": False, "error": f"Error transcribing audio with OpenAI: {str(e)}"}
+
+# Function to create a Word document with transcript and comments
+def create_word_doc(video_info, transcript, comments, output_path="./downloads"):
+    """Create a Word document with the video transcript and comments."""
+    try:
+        # Create a new Document
+        doc = Document()
+        
+        # Add document title
+        title = doc.add_heading(f"{video_info['title']}", level=1)
+        title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        
+        # Add video metadata
+        doc.add_paragraph(f"Channel: {video_info['channel']}")
+        doc.add_paragraph(f"Published: {video_info['published']}")
+        
+        # Add transcript section
+        doc.add_heading("Transcript", level=2)
+        doc.add_paragraph(transcript)
+        
+        # Add comments section
+        doc.add_heading(f"Comments ({len(comments)})", level=2)
+        
+        # Add table for comments
+        table = doc.add_table(rows=1, cols=3)
+        table.style = 'Table Grid'
+        
+        # Set table header
+        header_cells = table.rows[0].cells
+        header_cells[0].text = "Author"
+        header_cells[1].text = "Comment"
+        header_cells[2].text = "Likes"
+        
+        # Add comments to the table
+        for comment in comments:
+            row_cells = table.add_row().cells
+            row_cells[0].text = comment["author"]
+            row_cells[1].text = comment["text"]
+            row_cells[2].text = str(comment["likeCount"])
+        
+        # Save the document
+        safe_title = clean_filename(video_info["title"])
+        file_path = f"{output_path}/{safe_title}_transcript_comments.docx"
+        doc.save(file_path)
+        
+        return {"success": True, "file_path": file_path}
+    except Exception as e:
+        return {"success": False, "error": f"Error creating Word document: {str(e)}"}
+
 # Main Application UI
-st.markdown('<h1 class="highlight">YouTube Comments Downloader</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="highlight">YouTube Comments & Transcript Downloader</h1>', unsafe_allow_html=True)
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
+# API Key Input Section
+with st.expander("API Keys (Required)", expanded=not (YOUTUBE_API_KEY and OPENAI_API_KEY)):
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        youtube_api_key_input = st.text_input(
+            "YouTube API Key", 
+            value=YOUTUBE_API_KEY if YOUTUBE_API_KEY else "",
+            type="password", 
+            help="Required for fetching video info and comments"
+        )
+    
+    with col2:
+        openai_api_key_input = st.text_input(
+            "OpenAI API Key", 
+            value=OPENAI_API_KEY if OPENAI_API_KEY else "",
+            type="password", 
+            help="Required for audio transcription with Whisper"
+        )
+    
+    if not youtube_api_key_input:
+        st.warning("⚠️ YouTube API key is required.")
+    
+    if not openai_api_key_input:
+        st.warning("⚠️ OpenAI API key is required for transcription.")
+
 # Input area for multiple YouTube video URLs
-st.markdown("### Enter up to 10 YouTube video URLs (one per line):")
+st.markdown("### Enter up to 5 YouTube video URLs (one per line):")
 video_urls_text = st.text_area("YouTube Video URLs", placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...")
 
-if st.button("Download Comments for Videos"):
-    # Split the input text into lines and take up to 10 non-empty URLs
+if st.button("Process Videos (Download Audio, Generate Transcript & Comments)"):
+    # Validate API keys
+    if not youtube_api_key_input:
+        st.error("YouTube API key is required. Please enter your API key in the section above.")
+        st.stop()
+    
+    if not openai_api_key_input:
+        st.error("OpenAI API key is required for transcription. Please enter your API key in the section above.")
+        st.stop()
+    
+    # Split the input text into lines and take up to 5 non-empty URLs
     video_urls = [url.strip() for url in video_urls_text.splitlines() if url.strip()]
+    
     if not video_urls:
         st.error("Please enter at least one YouTube URL.")
-    elif len(video_urls) > 10:
-        st.error("Please enter no more than 10 URLs.")
+    elif len(video_urls) > 5:
+        st.error("Please enter no more than 5 URLs. Processing multiple videos consumes significant API resources.")
     else:
         for url in video_urls:
+            st.markdown(f"### Processing: {url}")
             with st.spinner(f"Processing {url} ..."):
                 video_id = extract_video_id(url)
                 if not video_id:
                     st.error(f"Could not extract video ID from the URL: {url}")
                     continue
-                # Fetch video info
-                video_info = get_video_info(video_id, YOUTUBE_API_KEY)
+                
+                # Step 1: Fetch video info
+                video_info = get_video_info(video_id, youtube_api_key_input)
                 if not video_info.get("success"):
-                    st.error(f"Error fetching video info for {url}: {video_info.get('error', 'Unknown error')}")
+                    st.error(f"Error fetching video info: {video_info.get('error', 'Unknown error')}")
                     continue
-                title = video_info["title"]
-                safe_title = clean_filename(title).replace(" ", "_")
-                # Fetch all comments
-                status_text = st.empty()
-                status_text.info(f"Fetching comments for '{title}'...")
-                comments = get_all_comments_with_callback(video_id, YOUTUBE_API_KEY, status_text=status_text)
+                
+                # Display video info
+                st.subheader(f"📺 {video_info['title']}")
+                st.write(f"Channel: {video_info['channel']}")
+                st.write(f"View Count: {int(video_info['view_count']):,}")
+                
+                # Step 2: Download audio
+                audio_status = st.empty()
+                audio_status.info("Downloading audio...")
+                audio_result = download_youtube_audio(url)
+                
+                if not audio_result.get("success"):
+                    st.error(f"Error downloading audio: {audio_result.get('error', 'Unknown error')}")
+                    continue
+                
+                audio_status.success("✅ Audio downloaded successfully")
+                
+                # Step 3: Generate transcript with Whisper
+                transcript_status = st.empty()
+                transcript_status.info("Generating transcript with OpenAI Whisper...")
+                
+                transcript_result = transcribe_with_whisper(audio_result["file_path"], openai_api_key_input)
+                
+                if not transcript_result.get("success"):
+                    st.error(f"Error generating transcript: {transcript_result.get('error', 'Unknown error')}")
+                    continue
+                
+                transcript_status.success("✅ Transcript generated successfully")
+                
+                # Step 4: Fetch all comments
+                comment_status = st.empty()
+                comment_status.info("Fetching comments...")
+                
+                comments = get_all_comments_with_callback(video_id, youtube_api_key_input, status_text=comment_status)
+                
                 if not comments:
-                    st.warning(f"No comments retrieved for '{title}'.")
+                    comment_status.warning("No comments retrieved or comments are disabled for this video.")
+                    # Continue processing even if no comments are found
+                else:
+                    comment_status.success(f"✅ Fetched {len(comments):,} comments")
+                
+                # Step 5: Create Word document with transcript and comments
+                doc_status = st.empty()
+                doc_status.info("Creating Word document...")
+                
+                doc_result = create_word_doc(
+                    video_info, 
+                    transcript_result["transcript"], 
+                    comments
+                )
+                
+                if not doc_result.get("success"):
+                    st.error(f"Error creating document: {doc_result.get('error', 'Unknown error')}")
                     continue
-                # Create a DataFrame and a download link
-                df_comments = pd.DataFrame(comments)
-                if "publishedAt" in df_comments.columns:
-                    df_comments["publishedAt"] = df_comments["publishedAt"].apply(format_timestamp)
-                filename = f"{safe_title}_comments.csv"
-                download_link = create_download_link(df_comments, filename, f"Download '{title}' Comments")
-                st.success(f"Fetched {len(comments):,} comments for '{title}'.")
-                st.markdown(download_link, unsafe_allow_html=True)
+                
+                doc_status.success("✅ Word document created successfully")
+                
+                # Create download link for the Word document
+                safe_title = clean_filename(video_info["title"])
+                doc_link = get_binary_file_downloader_html(
+                    doc_result["file_path"], 
+                    f"{safe_title}_transcript_comments.docx"
+                )
+                
+                st.markdown(doc_link, unsafe_allow_html=True)
+                
+                # Add a divider between videos
                 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
