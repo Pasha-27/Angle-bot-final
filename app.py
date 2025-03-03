@@ -1,746 +1,666 @@
 import streamlit as st
+import requests
 import pandas as pd
-import numpy as np
+import re
 import json
-import sqlite3
-import datetime
-import os
-from scipy.stats import median_abs_deviation
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import time
+import base64
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union
 
-# Load API Keys from Streamlit Secrets
-YOUTUBE_API_KEY = st.secrets["YOUTUBE_API_KEY"]
+# Configure page settings
+st.set_page_config(
+    page_title="YouTube Comments Downloader",
+    page_icon="💬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'About': "# YouTube Comments Downloader\nDownload all comments from any YouTube video sorted by like count."
+    }
+)
 
-# Function to fetch top 50 comments for a given video
-def get_video_comments(video_id, max_results=50):
-    youtube = get_youtube_service()
-    comments = []
-    try:
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=max_results,
-            textFormat="plainText"
-        )
-        response = request.execute()
-        items = response.get("items", [])
-        for item in items:
-            comment = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
-            comments.append(comment)
-    except HttpError as e:
-        st.error(f"API Error when fetching comments for video {video_id}: {e}")
-    return comments
-
-# Initialize YouTube API
-def get_youtube_service():
-    return build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-
-# Improved Database Schema
-def initialize_db():
-    db_exists = os.path.exists("youtube_data.db")
-    conn = sqlite3.connect("youtube_data.db")
-    cursor = conn.cursor()
-    
-    if not db_exists:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS search_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                video_id TEXT UNIQUE,
-                channel_id TEXT,
-                channel_name TEXT,
-                title TEXT,
-                description TEXT,
-                thumbnail TEXT,
-                published_date TEXT,
-                fetch_date TEXT,
-                views INTEGER DEFAULT 0,
-                likes INTEGER DEFAULT 0,
-                comments INTEGER DEFAULT 0,
-                outlier_score REAL DEFAULT 0
-            )
-        """)
-        # Add indices for better performance
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_video_id ON search_results (video_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_channel_id ON search_results (channel_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_outlier_score ON search_results (outlier_score)")
-    else:
-        cursor.execute("PRAGMA table_info(search_results)")
-        existing_columns = [column[1] for column in cursor.fetchall()]
-        expected_columns = {
-            "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
-            "video_id": "TEXT UNIQUE",
-            "channel_id": "TEXT",
-            "channel_name": "TEXT",
-            "title": "TEXT",
-            "description": "TEXT",
-            "thumbnail": "TEXT",
-            "published_date": "TEXT",
-            "fetch_date": "TEXT",
-            "views": "INTEGER DEFAULT 0",
-            "likes": "INTEGER DEFAULT 0",
-            "comments": "INTEGER DEFAULT 0",
-            "outlier_score": "REAL DEFAULT 0"
-        }
-        for column, column_type in expected_columns.items():
-            if column not in existing_columns and column != "id":
-                try:
-                    cursor.execute(f"ALTER TABLE search_results ADD COLUMN {column} {column_type}")
-                    st.info(f"Added missing column: {column}")
-                except sqlite3.Error as e:
-                    st.error(f"Error adding column {column}: {e}")
-    
-    conn.commit()
-    conn.close()
-
-# Clear Cache (Delete all records from the database)
-def clear_cache():
-    conn = sqlite3.connect("youtube_data.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM search_results")
-    conn.commit()
-    conn.close()
-
-# Improved database search function with better keyword matching
-def search_db_results(niche=None, keyword=None, min_outlier_score=None, sort_by="views", 
-                      niche_data=None, excluded_channels=None, video_type=None):
-    conn = sqlite3.connect("youtube_data.db")
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Include the duration column if needed by video_type filtering
-    query_parts = ["""
-        SELECT video_id, channel_id, channel_name, title, description, thumbnail, 
-               published_date, fetch_date, views, likes, comments, outlier_score, duration
-        FROM search_results
-    """]
-    
-    params = []
-    where_conditions = []
-    
-    if niche and niche_data and niche in niche_data:
-        channel_ids = [channel["channel_id"] for channel in niche_data[niche] 
-                       if not excluded_channels or channel["channel_id"] not in excluded_channels]
-        if channel_ids:
-            channel_placeholders = ",".join(["?"] * len(channel_ids))
-            where_conditions.append(f"channel_id IN ({channel_placeholders})")
-            params.extend(channel_ids)
-        else:
-            # If all channels are excluded, return empty result
-            return []
-    
-    # Modified keyword search logic: Each search term must be present
-    if keyword and keyword.strip():
-        search_terms = keyword.strip().lower().split()
-        term_conditions = []
-        for term in search_terms:
-            term_conditions.append("(LOWER(title) LIKE ? OR LOWER(description) LIKE ?)")
-            params.extend([f"%{term}%", f"%{term}%"])
-        # Join the individual term conditions with AND so all terms must be present
-        where_conditions.append(" AND ".join(term_conditions))
-    
-    if min_outlier_score is not None:
-        where_conditions.append("outlier_score >= ?")
-        params.append(min_outlier_score)
-    
-    # Add video duration filtering
-    if video_type == "short":
-        # Short videos are <= 3 minutes (180 seconds)
-        where_conditions.append("duration <= 180")
-    elif video_type == "long":
-        # Long videos are > 3 minutes
-        where_conditions.append("duration > 180")
-    
-    if where_conditions:
-        query_parts.append("WHERE " + " AND ".join(where_conditions))
-    
-    if sort_by:
-        query_parts.append(f"ORDER BY {sort_by} DESC")
-    
-    final_query = " ".join(query_parts)
-    
-    try:
-        cursor.execute(final_query, params)
-        results = cursor.fetchall()
-        result_list = [dict(row) for row in results]
-        # Remove duplicates based on video_id
-        unique_results = list({video["video_id"]: video for video in result_list}.values())
-        conn.close()
-        return unique_results
-    except sqlite3.Error as e:
-        st.error(f"Database error: {e}")
-        conn.close()
-        return []
-
-# Custom keyword search function for memory filtering
-def keyword_match(text, keyword):
-    if not keyword or not text:
-        return True
-    
-    text = text.lower()
-    search_terms = keyword.lower().strip().split()
-    
-    # Return True if all terms are present in the text
-    for term in search_terms:
-        if term not in text:
-            return False
-    
-    return True
-
-# Improved save to db function
-def save_to_db(video_data):
-    if not video_data:
-        return
-    conn = sqlite3.connect("youtube_data.db")
-    cursor = conn.cursor()
-    current_date = datetime.datetime.now().isoformat()
-    for video in video_data:
-        try:
-            cursor.execute("""
-                INSERT OR REPLACE INTO search_results (
-                    video_id, channel_id, channel_name, title, description, thumbnail, 
-                    published_date, fetch_date, views, likes, comments, outlier_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                video["video_id"],
-                video.get("channel_id", ""),
-                video.get("channel_name", ""),
-                video["title"],
-                video.get("description", ""),
-                video.get("thumbnail", ""),
-                video.get("published_date", ""),
-                current_date,
-                video.get("views", 0),
-                video.get("likes", 0),
-                video.get("comments", 0),
-                video.get("outlier_score", 0)
-            ))
-        except sqlite3.Error as e:
-            st.error(f"Error saving video {video.get('title', 'unknown')}: {e}")
-    conn.commit()
-    conn.close()
-
-# Load Niche Channels with error handling
-def load_niche_channels():
-    try:
-        with open("channels.json", "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        st.error("channels.json file not found!")
-        return {}
-    except json.JSONDecodeError:
-        st.error("Error parsing channels.json - invalid format!")
-        return {}
-
-# Compute outlier scores using Modified Z-Score with numpy for better performance
-def compute_outlier_scores(videos, metric="views"):
-    if not videos:
-        return videos
-    video_ids = [video["video_id"] for video in videos]
-    values = np.array([video.get(metric, 0) for video in videos])
-    if len(values) < 2:
-        for video in videos:
-            video["outlier_score"] = 0
-        return videos
-    median_value = np.median(values)
-    mad = median_abs_deviation(values)
-    if mad == 0:
-        for video in videos:
-            video["outlier_score"] = 0
-        return videos
-    scores = 0.6745 * (values - median_value) / mad
-    for i, video in enumerate(videos):
-        video["outlier_score"] = round(float(scores[i]), 2)
-    return videos
-
-# Fetch all videos from a channel with pagination
-def get_channel_videos(channel_id, channel_name, max_results=100):
-    youtube = get_youtube_service()
-    videos = []
-    next_page_token = None
-    total_results = 0
-    try:
-        while total_results < max_results:
-            batch_size = min(50, max_results - total_results)
-            request_params = {
-                "part": "id,snippet",
-                "channelId": channel_id,
-                "maxResults": batch_size,
-                "type": "video",
-                "order": "date"
-            }
-            if next_page_token:
-                request_params["pageToken"] = next_page_token
-            request = youtube.search().list(**request_params)
-            response = request.execute()
-            items = response.get("items", [])
-            if not items:
-                break
-            for item in items:
-                if "videoId" in item["id"]:
-                    video_id = item["id"]["videoId"]
-                    title = item["snippet"]["title"]
-                    description = item["snippet"].get("description", "")
-                    thumbnail = item["snippet"]["thumbnails"]["high"]["url"]
-                    published_date = item["snippet"]["publishedAt"]
-                    videos.append({
-                        "video_id": video_id,
-                        "channel_id": channel_id,
-                        "channel_name": channel_name,
-                        "title": title,
-                        "description": description,
-                        "thumbnail": thumbnail,
-                        "published_date": published_date
-                    })
-            total_results += len(items)
-            next_page_token = response.get("nextPageToken")
-            if not next_page_token:
-                break
-        return videos
-    except HttpError as e:
-        st.error(f"API Error for channel {channel_name}: {e}")
-        return []
-
-# Fetch video statistics in batches
-def get_video_statistics(videos):
-    youtube = get_youtube_service()
-    if not videos:
-        return videos
-    video_ids = [video["video_id"] for video in videos]
-    video_dict = {video["video_id"]: video for video in videos}
-    for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i + 50]
-        try:
-            request = youtube.videos().list(
-                part="statistics",
-                id=",".join(chunk)
-            )
-            response = request.execute()
-            for item in response.get("items", []):
-                video_id = item["id"]
-                if video_id in video_dict:
-                    stats = item.get("statistics", {})
-                    video_dict[video_id]["views"] = int(stats.get("viewCount", 0))
-                    video_dict[video_id]["likes"] = int(stats.get("likeCount", 0))
-                    video_dict[video_id]["comments"] = int(stats.get("commentCount", 0))
-        except HttpError as e:
-            st.error(f"API Error when fetching statistics: {e}")
-    return list(video_dict.values())
-
-# Check if data needs refreshing
-def needs_refresh(data, max_age_days=7):
-    if not data:
-        return True
-    current_date = datetime.datetime.now()
-    for item in data:
-        fetch_date_str = item.get("fetch_date")
-        if not fetch_date_str:
-            return True
-        try:
-            fetch_date = datetime.datetime.fromisoformat(fetch_date_str)
-            age = (current_date - fetch_date).days
-            if age > max_age_days:
-                return True
-        except ValueError:
-            return True
-    return False
-
-# Recreate database if needed
-def recreate_database():
-    try:
-        if os.path.exists("youtube_data.db"):
-            os.remove("youtube_data.db")
-            st.success("Database file removed successfully.")
-        initialize_db()
-        st.success("Database has been recreated with the new schema.")
-    except Exception as e:
-        st.error(f"Error recreating database: {e}")
-
-# Initialize Database
-initialize_db()
-
-# Apply Styling with additional CSS for metrics and channel pills
-st.set_page_config(layout="wide", page_title="YouTube Outlier Detector")
+    # Apply custom CSS for dark mode and modern UI
 st.markdown("""
 <style>
+    /* Dark mode theme */
     .stApp {
-        max-width: 1200px;
-        margin: 0 auto;
+        background-color: #121212;
+        color: #f0f0f0;
     }
-    .video-card {
-        border: 1px solid #e0e0e0;
+    
+    /* Card-like containers */
+    .card {
+        background-color: #1e1e1e;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    
+    /* Header styling */
+    h1, h2, h3 {
+        color: #ffffff;
+        font-weight: 600;
+    }
+    
+    /* Accent colors for highlights */
+    .highlight {
+        color: #ff5252;
+    }
+    
+    /* Button hover effects */
+    .stButton>button:hover {
+        background-color: #ff5252;
+        border-color: #ff5252;
+    }
+    
+    /* Improved spacing */
+    .spacer {
+        margin-top: 1rem;
+        margin-bottom: 1rem;
+    }
+    
+    /* Progress bar styling */
+    .stProgress > div > div {
+        background-color: #ff5252;
+    }
+
+    /* Improved table styling */
+    .dataframe {
+        font-size: 14px;
+    }
+    
+    /* Custom divider */
+    .divider {
+        height: 3px;
+        background: linear-gradient(90deg, #ff5252, transparent);
+        margin: 20px 0;
+        border-radius: 10px;
+    }
+
+    /* Comment styling */
+    .comment-card {
+        background-color: #2d2d2d;
         border-radius: 8px;
         padding: 15px;
-        margin-bottom: 15px;
-        background-color: #f9f9f9;
+        margin-bottom: 10px;
+        border-left: 3px solid #ff5252;
+        word-wrap: break-word;
     }
-    .video-title {
+    
+    .comment-card.reply-comment {
+        margin-left: 25px;
+        border-left: 3px solid #4d7aff;
+        background-color: #252525;
+    }
+    
+    .author-name {
+        color: #ff5252;
         font-weight: bold;
-        margin-bottom: 5px;
     }
-    .video-stats {
+    
+    .reply-comment .author-name {
+        color: #4d7aff;
+    }
+    
+    .comment-text {
+        margin-top: 8px;
+        margin-bottom: 8px;
+        line-height: 1.4;
+    }
+    
+    .like-count {
+        color: #aaaaaa;
+        font-size: 0.8rem;
+    }
+    
+    .timestamp {
+        color: #888888;
+        font-size: 0.8rem;
+        display: inline-block;
+        margin-left: 10px;
+    }
+    
+    /* Pagination styling */
+    .pagination {
         display: flex;
-        justify-content: space-between;
-        margin-top: 10px;
+        justify-content: center;
+        margin-top: 20px;
+        margin-bottom: 20px;
     }
-    /* Reduce the font size for metric values and labels */
-    div[data-testid="stMetricValue"] {
-        font-size: 14px !important;
+    
+    .pagination-btn {
+        margin: 0 5px;
     }
-    div[data-testid="stMetricLabel"] {
-        font-size: 12px !important;
-    }
-    /* Channel pill styling */
-    .channel-pill-container {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
+    
+    /* Download button styling */
+    .download-button {
+        display: inline-block;
+        background-color: #ff5252;
+        color: white;
+        padding: 8px 16px;
+        border-radius: 4px;
+        text-decoration: none;
+        font-weight: bold;
         margin: 10px 0;
+        transition: background-color 0.3s;
     }
-    .channel-pill {
-        background-color: #f0f2f6;
-        border-radius: 20px;
-        padding: 5px 10px;
-        font-size: 0.85rem;
-        display: flex;
-        align-items: center;
-        margin-bottom: 5px;
+    
+    .download-button:hover {
+        background-color: #ff3333;
     }
-    .channel-pill-active {
-        background-color: #e0f7fa;
-        border: 1px solid #26c6da;
+    
+    /* Error and warning messages */
+    .warning-box {
+        background-color: rgba(255, 193, 7, 0.1);
+        border-left: 4px solid #ffc107;
+        padding: 10px 15px;
+        margin: 10px 0;
+        border-radius: 0 4px 4px 0;
     }
-    .channel-pill-excluded {
-        background-color: #ffebee;
-        border: 1px solid #ef5350;
-        text-decoration: line-through;
-    }
-    .channel-pill-button {
-        cursor: pointer;
-        margin-left: 5px;
-        color: #616161;
-        font-weight: bold;
-    }
-    .channel-pill-button:hover {
-        color: #ef5350;
+    
+    .error-box {
+        background-color: rgba(244, 67, 54, 0.1);
+        border-left: 4px solid #f44336;
+        padding: 10px 15px;
+        margin: 10px 0;
+        border-radius: 0 4px 4px 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎥 YouTube Outlier Video Detector")
-st.markdown("Find standout videos across channels based on performance metrics")
-
-# Initialize session state for excluded channels if it doesn't exist
-if 'excluded_channels' not in st.session_state:
-    st.session_state.excluded_channels = set()
-
-# Sidebar for controls
-with st.sidebar:
-    st.header("🔍 Filter Options")
-    niche_data = load_niche_channels()
-    niches = list(niche_data.keys())
+# Helper functions
+def extract_video_id(url: str) -> Optional[str]:
+    """Extract the video ID from a YouTube URL."""
+    patterns = [
+        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
+        r"(?:youtu\.be\/)([0-9A-Za-z_-]{11})",
+        r"(?:embed\/)([0-9A-Za-z_-]{11})"
+    ]
     
-    if not niches:
-        st.error("No niches found in channels.json. Please check the file.")
-        selected_niche = None
-    else:
-        selected_niche = st.selectbox("Select a Niche", niches)
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def get_comments(video_id: str, api_key: str, page_token: Optional[str] = None) -> Dict:
+    """Fetch comments for a video using YouTube Data API v3."""
+    api_url = "https://www.googleapis.com/youtube/v3/commentThreads"
+    params = {
+        "part": "snippet,replies",
+        "videoId": video_id,
+        "maxResults": 100,  # Maximum allowed by the API
+        "textFormat": "plainText",
+        "key": api_key,
+        "order": "relevance"  # This helps get more popular comments first
+    }
     
-    # Channel selection section
-    if selected_niche:
-        st.subheader("Channel Selection")
-        st.markdown("Click on a channel to exclude/include it in the search:")
+    if page_token:
+        params["pageToken"] = page_token
+    
+    try:
+        response = requests.get(api_url, params=params, timeout=10)  # Add timeout for better error handling
         
-        # Create a container for channel pills
-        channel_pills_html = '<div class="channel-pill-container">'
+        if response.status_code != 200:
+            error_message = f"HTTP error {response.status_code}"
+            try:
+                error_data = response.json()
+                if "error" in error_data and "message" in error_data["error"]:
+                    error_message = error_data["error"]["message"]
+            except Exception:
+                pass
+            return {"success": False, "error": error_message}
         
-        for channel in niche_data.get(selected_niche, []):
-            channel_id = channel["channel_id"]
-            channel_name = channel["channel_name"]
-            
-            is_excluded = channel_id in st.session_state.excluded_channels
-            pill_class = "channel-pill channel-pill-excluded" if is_excluded else "channel-pill channel-pill-active"
-            
-            channel_pills_html += f"""
-            <div class="{pill_class}">
-                {channel_name}
-                <span class="channel-pill-button" onclick="
-                    const data = {{
-                        channel_id: '{channel_id}',
-                        action: '{'include' if is_excluded else 'exclude'}'
-                    }};
-                    window.parent.postMessage({{
-                        type: 'streamlit:toggleChannel',
-                        data: data
-                    }}, '*');
-                ">{"+" if is_excluded else "×"}</span>
-            </div>
-            """
+        return {"success": True, "data": response.json()}
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "Request timed out. YouTube API might be slow or experiencing issues."}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": "Connection error. Please check your internet connection."}
+    except Exception as e:
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+
+def process_comment_data(data: Dict) -> Tuple[List[Dict], Optional[str]]:
+    """Extract comment information from API response."""
+    comments = []
+    
+    for item in data.get("items", []):
+        # Process top-level comment
+        snippet = item["snippet"]["topLevelComment"]["snippet"]
+        author = snippet.get("authorDisplayName", "Unknown")
+        text = snippet.get("textDisplay", "")
+        like_count = snippet.get("likeCount", 0)
+        published_at = snippet.get("publishedAt", "")
         
-        channel_pills_html += '</div>'
+        comments.append({
+            "author": author,
+            "text": text,
+            "likeCount": like_count,
+            "publishedAt": published_at,
+            "isReply": False
+        })
         
-        # Display the channel pills
-        st.markdown(channel_pills_html, unsafe_allow_html=True)
-        
-        # Handle channel toggle from JavaScript via a hidden button click
-        toggle_channel_placeholder = st.empty()
-        toggle_channel = toggle_channel_placeholder.button("Toggle Channel", key="toggle_channel_btn", help="This button is programmatically clicked by JavaScript")
-        
-        if toggle_channel:
-            # Extract channel ID and action from query parameters
-            query_params = st.experimental_get_query_params()
-            channel_id = query_params.get("channel_id", [""])[0]
-            action = query_params.get("action", [""])[0]
-            
-            if channel_id and action:
-                if action == "exclude" and channel_id not in st.session_state.excluded_channels:
-                    st.session_state.excluded_channels.add(channel_id)
-                elif action == "include" and channel_id in st.session_state.excluded_channels:
-                    st.session_state.excluded_channels.remove(channel_id)
+        # Process replies if any
+        if "replies" in item:
+            for reply in item["replies"]["comments"]:
+                reply_snippet = reply["snippet"]
+                reply_author = reply_snippet.get("authorDisplayName", "Unknown")
+                reply_text = reply_snippet.get("textDisplay", "")
+                reply_like_count = reply_snippet.get("likeCount", 0)
+                reply_published_at = reply_snippet.get("publishedAt", "")
                 
-                # Clear query parameters
-                st.experimental_set_query_params()
-                # Force a rerun to update the UI
-                st.experimental_rerun()
-        
-        # Alternative channel selection method using checkboxes (no JavaScript needed)
-        st.markdown("### Alternative Channel Selection")
-        excluded_channels_temp = set(st.session_state.excluded_channels)
-        
-        for channel in niche_data.get(selected_niche, []):
-            channel_id = channel["channel_id"]
-            channel_name = channel["channel_name"]
-            
-            is_included = st.checkbox(
-                f"Include {channel_name}", 
-                value=channel_id not in st.session_state.excluded_channels,
-                key=f"channel_{channel_id}"
-            )
-            
-            if not is_included:
-                excluded_channels_temp.add(channel_id)
-            elif channel_id in excluded_channels_temp:
-                excluded_channels_temp.remove(channel_id)
-        
-        st.session_state.excluded_channels = excluded_channels_temp
-        
-        # Button to reset channel selection
-        if st.button("Reset Channel Selection"):
-            st.session_state.excluded_channels = set()
-            st.experimental_rerun()
+                comments.append({
+                    "author": reply_author,
+                    "text": reply_text,
+                    "likeCount": reply_like_count,
+                    "publishedAt": reply_published_at,
+                    "isReply": True
+                })
     
-    keyword = st.text_input("🔎 Enter keyword to search within videos")
+    # Check if there are more pages of comments
+    next_page_token = data.get("nextPageToken")
     
-    st.subheader("Advanced Options")
-    outlier_threshold = st.slider("Minimum Outlier Score", min_value=0, max_value=20, value=5, step=1)
-    
-    max_results_per_channel = st.slider("Max Videos per Channel", min_value=10, max_value=200, value=50, step=10)
-    
-    refresh_days = st.slider("Refresh data older than (days)", min_value=1, max_value=30, value=7, step=1)
-    force_refresh = st.checkbox("Force refresh all data")
-    
-    sort_options = {
-        "View Count": "views",
-        "Outlier Score": "outlier_score",
-        "Likes": "likes",
-        "Comments": "comments" 
+    return comments, next_page_token
+
+def format_timestamp(timestamp: str) -> str:
+    """Format API timestamp to a readable date."""
+    try:
+        dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%b %d, %Y")
+    except Exception:
+        return timestamp
+
+def get_video_info(video_id: str, api_key: str) -> Dict:
+    """Get basic information about the video."""
+    api_url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {
+        "part": "snippet,statistics",
+        "id": video_id,
+        "key": api_key
     }
     
-    sort_option = st.selectbox("Sort results by", list(sort_options.keys()))
+    response = requests.get(api_url, params=params)
     
-    fetch_button = st.button("🔍 Find Outliers")
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP error {response.status_code}: {response.text}"}
     
-    st.header("🛠️ Database Maintenance")
+    data = response.json()
     
-    if st.button("🗑️ Clear Cache"):
-        clear_cache()
-        st.success("Cache cleared! All data has been removed from the database.")
+    if not data.get("items"):
+        return {"success": False, "error": "Video not found"}
     
-    if st.button("🔄 Recreate Database"):
-        recreate_database()
-        st.success("Database has been recreated with the updated schema.")
-
-# Add JavaScript to handle channel toggling
-st.markdown("""
-<script>
-// Listen for messages from the channel pills
-window.addEventListener('message', function(event) {
-    if (event.data.type === 'streamlit:toggleChannel') {
-        const channelData = event.data.data;
-        // Set query parameters to communicate with Streamlit
-        const searchParams = new URLSearchParams(window.location.search);
-        searchParams.set('channel_id', channelData.channel_id);
-        searchParams.set('action', channelData.action);
-        // Update URL (doesn't reload the page)
-        window.history.pushState({}, '', '?' + searchParams.toString());
-        // Click the hidden button to trigger the Streamlit event
-        setTimeout(() => {
-            document.querySelector('[data-testid="stButton"] button').click();
-        }, 100);
+    video_data = data["items"][0]
+    snippet = video_data["snippet"]
+    statistics = video_data["statistics"]
+    
+    return {
+        "success": True,
+        "title": snippet.get("title", "Unknown Title"),
+        "channel": snippet.get("channelTitle", "Unknown Channel"),
+        "published": snippet.get("publishedAt", "Unknown Date"),
+        "comment_count": statistics.get("commentCount", "0"),
+        "view_count": statistics.get("viewCount", "0"),
+        "like_count": statistics.get("likeCount", "0"),
+        "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", "")
     }
-});
-</script>
-""", unsafe_allow_html=True)
 
-# Display currently excluded channels info
-if st.session_state.excluded_channels:
-    excluded_channel_names = []
-    for channel in niche_data.get(selected_niche, []):
-        if channel["channel_id"] in st.session_state.excluded_channels:
-            excluded_channel_names.append(channel["channel_name"])
+def get_all_comments(video_id: str, api_key: str, progress_bar=None, status_text=None) -> List[Dict]:
+    """Fetch all comments by paging through results."""
+    all_comments = []
+    next_page_token = None
+    page_num = 1
+    max_pages = 500  # Safety limit for extremely popular videos
+    error_count = 0
+    max_errors = 3  # Maximum consecutive errors before giving up
     
-    st.warning(f"Currently excluding {len(excluded_channel_names)} channels: {', '.join(excluded_channel_names)}")
+    while True and page_num <= max_pages:
+        # Update progress status
+        if status_text:
+            status_text.text(f"Fetching page {page_num} of comments...")
+        
+        try:
+            # Fetch comments for current page
+            result = get_comments(video_id, api_key, next_page_token)
+            
+            if not result["success"]:
+                error_count += 1
+                error_message = result.get('error', 'Unknown error')
+                
+                if error_count >= max_errors:
+                    if status_text:
+                        status_text.error(f"Too many errors: {error_message}. Stopping comment retrieval.")
+                    break
+                
+                if "quota" in error_message.lower():
+                    if status_text:
+                        status_text.error(f"API quota exceeded: {error_message}")
+                    break
+                
+                if status_text:
+                    status_text.warning(f"Error on page {page_num}: {error_message}. Retrying in 2 seconds...")
+                
+                # Wait longer before retry for rate limiting issues
+                time.sleep(2)
+                continue
+            
+            # Reset error counter on success
+            error_count = 0
+            
+            # Process comments from current page
+            comments, next_page_token = process_comment_data(result["data"])
+            all_comments.extend(comments)
+            
+            # Update progress
+            if progress_bar and "commentCount" in st.session_state:
+                try:
+                    total_comments = int(st.session_state["commentCount"])
+                    if total_comments > 0:
+                        progress = min(1.0, len(all_comments) / total_comments)
+                        progress_bar.progress(progress)
+                except (ValueError, TypeError):
+                    # If commentCount is invalid, show progress based on pages
+                    progress_bar.progress(min(1.0, page_num / 50))
+            
+            # Display warning for large comment retrieval
+            if page_num % 10 == 0 and status_text:
+                status_text.info(f"Downloaded {len(all_comments)} comments so far...")
+            
+            # Check if we've reached the last page
+            if not next_page_token:
+                break
+            
+            # Add a small delay to avoid rate limiting
+            time.sleep(0.5)
+            page_num += 1
+            
+            # Safety check for extremely large comment sets
+            if page_num == max_pages and status_text:
+                status_text.warning(f"Reached maximum page limit ({max_pages}). Some comments may not be retrieved.")
+        
+        except Exception as e:
+            error_count += 1
+            if status_text:
+                status_text.warning(f"Unexpected error on page {page_num}: {str(e)}. Retrying...")
+            
+            if error_count >= max_errors:
+                if status_text:
+                    status_text.error(f"Too many consecutive errors. Stopping comment retrieval.")
+                break
+            
+            time.sleep(2)  # Wait before retry
+    
+    return all_comments
+
+def create_download_link(df: pd.DataFrame, filename: str, link_text: str) -> str:
+    """Generate a download link for a DataFrame."""
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" class="download-button">{link_text}</a>'
+    return href
+
+# Main application layout
+st.markdown('<h1 class="highlight">YouTube Comments Downloader</h1>', unsafe_allow_html=True)
+st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+
+# Sidebar for API key and options
+with st.sidebar:
+    st.markdown('<h3>⚙️ Settings</h3>', unsafe_allow_html=True)
+    
+    api_key = st.text_input(
+        "YouTube API Key",
+        type="password",
+        help="Get your API key from the Google Developer Console"
+    )
+    
+    st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
+    
+    # Sorting options
+    st.markdown('<h3>🔄 Sort Options</h3>', unsafe_allow_html=True)
+    sort_by = st.radio(
+        "Sort comments by",
+        options=["Most Likes", "Newest First", "Oldest First"],
+        index=0
+    )
+    
+    # Filtering options
+    st.markdown('<h3>🔍 Filter Options</h3>', unsafe_allow_html=True)
+    
+    min_likes = st.number_input(
+        "Minimum likes",
+        min_value=0,
+        value=0,
+        step=1
+    )
+    
+    include_replies = st.checkbox("Include replies", value=True)
+    
+    # Footer info
+    st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-size: 0.8rem; color: #888888;">
+        This app uses the YouTube Data API v3.<br>
+        API quota limit: 10,000 units per day.<br>
+        Each comment fetch uses ~1 unit.
+    </div>
+    """, unsafe_allow_html=True)
 
 # Main content area
-if fetch_button and selected_niche:
-    with st.spinner("Searching for videos..."):
-        try:
-            db_results = search_db_results(
-                niche=selected_niche,
-                keyword=keyword, 
-                min_outlier_score=outlier_threshold,
-                sort_by=sort_options[sort_option],
-                niche_data=niche_data,
-                excluded_channels=st.session_state.excluded_channels
+with st.container():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    youtube_url = st.text_input(
+        "Enter YouTube URL",
+        placeholder="https://www.youtube.com/watch?v=..."
+    )
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        process_button = st.button("Get Comments", type="primary")
+    with col2:
+        if st.button("Clear Results"):
+            # Reset session state to clear results
+            for key in ['comments', 'video_info', 'commentCount']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.experimental_rerun()
+            
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Process video when the button is clicked
+    if process_button and youtube_url and api_key:
+        # Extract video ID
+        video_id = extract_video_id(youtube_url)
+        
+        if not video_id:
+            st.error("Invalid YouTube URL. Please check the URL and try again.")
+        else:
+            # Get video information first
+            with st.spinner("Fetching video information..."):
+                video_info = get_video_info(video_id, api_key)
+                
+                if not video_info["success"]:
+                    st.error(f"Error: {video_info.get('error', 'Unable to fetch video information')}")
+                else:
+                    st.session_state["video_info"] = video_info
+                    st.session_state["commentCount"] = video_info["comment_count"]
+                    
+                    # Display video information
+                    st.markdown('<div class="card">', unsafe_allow_html=True)
+                    col1, col2 = st.columns([1, 3])
+                    
+                    with col1:
+                        st.image(video_info["thumbnail"], use_column_width=True)
+                        
+                    with col2:
+                        st.markdown(f"### {video_info['title']}")
+                        st.markdown(f"**Channel:** {video_info['channel']}")
+                        st.markdown(f"**Published:** {format_timestamp(video_info['published'])}")
+                        st.markdown(f"**Views:** {int(video_info['view_count']):,}")
+                        st.markdown(f"**Likes:** {int(video_info['like_count']):,}")
+                        st.markdown(f"**Comments:** {int(video_info['comment_count']):,}")
+                    
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # Fetch all comments with progress tracking
+                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+                    st.markdown("### Downloading Comments")
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    status_text.text(f"Fetching comments... This might take a while for videos with many comments.")
+                    
+                    # Get all comments
+                    all_comments = get_all_comments(video_id, api_key, progress_bar, status_text)
+                    
+                    # Store in session state
+                    st.session_state["comments"] = all_comments
+                    
+                    # Update status
+                    progress_bar.progress(1.0)
+                    
+                    if len(all_comments) == 0:
+                        status_text.error("No comments were retrieved. The video might have comments disabled.")
+                    elif len(all_comments) < int(video_info["comment_count"]) * 0.5 and int(video_info["comment_count"]) > 10:
+                        # If we retrieved less than 50% of the expected comments
+                        status_text.warning(f"Downloaded {len(all_comments)} comments, but the video has approximately {video_info['comment_count']} comments. Some comments may be missing due to API limitations.")
+                    else:
+                        status_text.success(f"Downloaded {len(all_comments)} comments successfully!")
+                        
+                    # Add explanation if needed
+                    if int(video_info["comment_count"]) > 10000:
+                        st.info("⚠️ Note: For videos with a very large number of comments, YouTube's API may not return all historical comments.")
+    
+    # Display fetched comments if available
+    if "comments" in st.session_state and "video_info" in st.session_state:
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown("### Comments")
+        
+        # Apply filters and sorting
+        filtered_comments = st.session_state["comments"].copy()
+        
+        # Filter by minimum likes
+        if min_likes > 0:
+            filtered_comments = [c for c in filtered_comments if c["likeCount"] >= min_likes]
+        
+        # Filter replies if needed
+        if not include_replies:
+            filtered_comments = [c for c in filtered_comments if not c["isReply"]]
+        
+        # Apply sorting
+        if sort_by == "Most Likes":
+            filtered_comments = sorted(filtered_comments, key=lambda x: x["likeCount"], reverse=True)
+        elif sort_by == "Newest First":
+            filtered_comments = sorted(filtered_comments, key=lambda x: x["publishedAt"], reverse=True)
+        elif sort_by == "Oldest First":
+            filtered_comments = sorted(filtered_comments, key=lambda x: x["publishedAt"])
+        
+        # Show comment count
+        st.write(f"Showing {len(filtered_comments)} comments out of {len(st.session_state['comments'])} total")
+        
+        # Create DataFrame for download
+        df_comments = pd.DataFrame(filtered_comments)
+        if not df_comments.empty:
+            # Format timestamps
+            if "publishedAt" in df_comments.columns:
+                df_comments["publishedAt"] = df_comments["publishedAt"].apply(format_timestamp)
+            
+            # Generate download buttons
+            video_title = st.session_state["video_info"]["title"]
+            safe_title = re.sub(r'[^\w\s-]', '', video_title).strip().replace(' ', '_')
+            filename = f"{safe_title}_comments.csv"
+            
+            st.markdown(
+                create_download_link(df_comments, filename, "Download as CSV"),
+                unsafe_allow_html=True
             )
             
-            refresh_needed = needs_refresh(db_results, max_age_days=refresh_days) or force_refresh
-            
-            if db_results and not refresh_needed:
-                st.success(f"✅ Found {len(db_results)} videos in the database")
-                video_data = db_results
-            else:
-                st.info("Fetching fresh data from YouTube...")
-                niche_channels = [
-                    channel for channel in niche_data.get(selected_niche, []) 
-                    if channel["channel_id"] not in st.session_state.excluded_channels
-                ]
-                if not niche_channels:
-                    st.warning(f"No channels selected for the niche: {selected_niche}")
-                    video_data = []
-                else:
-                    all_videos = []
-                    progress_bar = st.progress(0)
-                    for i, channel in enumerate(niche_channels):
-                        channel_videos = get_channel_videos(
-                            channel["channel_id"], 
-                            channel["channel_name"],
-                            max_results=max_results_per_channel
-                        )
-                        if channel_videos:
-                            progress_bar.progress((i + 0.5) / len(niche_channels))
-                            st.text(f"Fetching statistics for {len(channel_videos)} videos...")
-                            channel_videos = get_video_statistics(channel_videos)
-                            all_videos.extend(channel_videos)
-                        progress_bar.progress((i + 1) / len(niche_channels))
-                    if all_videos:
-                        st.text("Calculating outlier scores...")
-                        all_videos = compute_outlier_scores(all_videos, metric="views")
-                        save_to_db(all_videos)
-                        video_data = [
-                            video for video in all_videos
-                            if (not keyword or 
-                                (keyword.lower() in video["title"].lower() or 
-                                 keyword.lower() in video.get("description", "").lower())) and
-                            video.get("outlier_score", 0) >= outlier_threshold
-                        ]
-                        # Remove duplicates if any
-                        video_data = list({video["video_id"]: video for video in video_data}.values())
-                        video_data = sorted(
-                            video_data, 
-                            key=lambda x: x.get(sort_options[sort_option], 0), 
-                            reverse=True
-                        )
-                        st.success(f"✅ Found {len(video_data)} videos matching your criteria")
-                    else:
-                        st.warning("No videos found for the selected niche.")
-                        video_data = []
-            
-            # After obtaining search results, fetch top 50 comments for each video
-            if video_data:
-                with st.spinner("Fetching top comments for each video..."):
-                    for video in video_data:
-                        video["top_comments"] = get_video_comments(video["video_id"], max_results=50)
-            
-            # Display the results
-            if video_data:
-                df = pd.DataFrame(video_data)
-                if 'channel_name' in df.columns and 'title' in df.columns:
-                    display_cols = ['channel_name', 'title', 'views', 'likes', 'comments', 'outlier_score']
-                    display_names = ['Channel', 'Title', 'Views', 'Likes', 'Comments', 'Outlier Score']
-                    for col in display_cols:
-                        if col not in df.columns:
-                            df[col] = "N/A"
-                    df_display = df[display_cols].copy()
-                    df_display.columns = display_names
-                    st.subheader("Results Overview")
-                    st.dataframe(df_display, height=300)
-                # Add pagination for results
-                items_per_page = 10
-                total_pages = len(video_data) // items_per_page + (1 if len(video_data) % items_per_page > 0 else 0)
-                if total_pages > 1:
-                    page = st.slider("Page", 1, max(1, total_pages), 1)
-                    start_idx = (page - 1) * items_per_page
-                    end_idx = min(start_idx + items_per_page, len(video_data))
-                    display_videos = video_data[start_idx:end_idx]
-                    st.info(f"Showing results {start_idx+1}-{end_idx} of {len(video_data)}")
-                else:
-                    display_videos = video_data[:10]
+            # Display comments - showing all comments in the UI
+            if filtered_comments:
+                # Add pagination for better performance
+                items_per_page = 50
+                total_pages = (len(filtered_comments) + items_per_page - 1) // items_per_page
                 
-                st.subheader("Top Videos")
-                # Create two columns for displaying videos side by side
-                cols = st.columns(2)
-                for idx, video in enumerate(display_videos):
-                    with cols[idx % 2]:
-                        st.image(video.get("thumbnail"), use_container_width=True)
-                        st.markdown(f"### {video.get('title', 'No Title')}")
-                        st.markdown(f"**Channel:** {video.get('channel_name', 'Unknown')}")
-                        stat_cols = st.columns(4)
-                        with stat_cols[0]:
-                            st.metric("Views", f"{video.get('views', 0):,}")
-                        with stat_cols[1]:
-                            st.metric("Likes", f"{video.get('likes', 0):,}")
-                        with stat_cols[2]:
-                            st.metric("Comments", f"{video.get('comments', 0):,}")
-                        with stat_cols[3]:
-                            st.metric("Outlier Score", f"{video.get('outlier_score', 0):.2f}")
-                        video_url = f"https://www.youtube.com/watch?v={video.get('video_id', '')}"
-                        st.markdown(f"[Watch Video]({video_url})")
-                        with st.expander("Show Top Comments"):
-                            comments = video.get("top_comments", [])
-                            if comments:
-                                for comment in comments:
-                                    st.markdown(f"- {comment}")
-                            else:
-                                st.markdown("No comments available.")
-                        st.markdown("---")
+                if total_pages > 1:
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"Total comments: {len(filtered_comments)}")
+                    with col2:
+                        page_num = st.selectbox("Page", range(1, total_pages + 1), index=0)
+                else:
+                    page_num = 1
+                    st.write(f"Total comments: {len(filtered_comments)}")
+                
+                start_idx = (page_num - 1) * items_per_page
+                end_idx = min(start_idx + items_per_page, len(filtered_comments))
+                
+                page_comments = filtered_comments[start_idx:end_idx]
+                
+                # Display warning for large comment sets
+                if len(filtered_comments) > 1000:
+                    st.warning("⚠️ This video has a large number of comments. The UI might be slower to respond.")
+                
+                # Display comments for this page
+                for i, comment in enumerate(page_comments):
+                    # Determine if it's a reply
+                    indent = "" if not comment["isReply"] else "↪️ "
+                    reply_class = "comment-card" if not comment["isReply"] else "comment-card reply-comment"
+                    
+                    # Format the comment
+                    st.markdown(f"""
+                    <div class="{reply_class}">
+                        <div class="author-name">{indent}{comment["author"]}</div>
+                        <div class="timestamp">{format_timestamp(comment["publishedAt"])}</div>
+                        <div class="comment-text">{comment["text"]}</div>
+                        <div class="like-count">👍 {comment["likeCount"]} likes</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Add pagination controls at the bottom for convenience
+                if total_pages > 1:
+                    st.write(f"Showing page {page_num} of {total_pages}")
+                    
+                    cols = st.columns([1, 1, 1, 1])
+                    with cols[0]:
+                        if page_num > 1:
+                            if st.button("⏮️ First"):
+                                st.session_state["page_num"] = 1
+                                st.experimental_rerun()
+                    with cols[1]:
+                        if page_num > 1:
+                            if st.button("◀️ Previous"):
+                                st.session_state["page_num"] = page_num - 1
+                                st.experimental_rerun()
+                    with cols[2]:
+                        if page_num < total_pages:
+                            if st.button("Next ▶️"):
+                                st.session_state["page_num"] = page_num + 1
+                                st.experimental_rerun()
+                    with cols[3]:
+                        if page_num < total_pages:
+                            if st.button("Last ⏭️"):
+                                st.session_state["page_num"] = total_pages
+                                st.experimental_rerun()
             else:
-                st.warning("No videos found matching your criteria. Try adjusting your filters.")
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            import traceback
-            st.error(traceback.format_exc())
-elif fetch_button and not selected_niche:
-    st.warning("Please select a niche first!")
-else:
-    st.info("👈 Select filters and click 'Find Outliers' to search for videos")
-    st.markdown("""
-    ## How to use this app
+                st.info("No comments match your current filter settings.")
     
-    1. **Select a niche** from the dropdown menu
-    2. **Select/deselect channels** you want to include in your search
-    3. Optionally **enter a keyword** to search within video titles and descriptions
-    4. Adjust the **minimum outlier score** to filter for truly exceptional videos
-    5. Choose how to **sort** your results
-    6. Click the **Find Outliers** button to see the results
-    
-    ## What is an outlier score?
-    
-    The outlier score measures how much a video deviates from the typical performance of videos in the same niche:
-    
-    - **Score > 5**: The video is performing better than most others
-    - **Score > 10**: The video is a significant outlier (very successful)
-    - **Score > 15**: The video is an extreme outlier (viral potential)
-    
-    The score is calculated using a statistical method called Modified Z-Score based on median absolute deviation.
-    """)
+    # Display help when no URL is provided
+    if not youtube_url:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("""
+        ### 📝 How to use this app
+        
+        1. Enter your YouTube API key in the sidebar
+        2. Paste a YouTube video URL in the text box
+        3. Click "Get Comments" to download comments
+        4. Use the sidebar options to sort and filter comments
+        5. Download all comments as a CSV file
+        
+        ### 🔑 Getting a YouTube API Key
+        
+        1. Go to [Google Developer Console](https://console.developers.google.com/)
+        2. Create a new project
+        3. Enable the YouTube Data API v3
+        4. Create an API key and copy it
+        5. Paste the API key in the sidebar
+        """)
+        st.markdown('</div>', unsafe_allow_html=True)
