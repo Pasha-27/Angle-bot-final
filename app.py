@@ -13,6 +13,9 @@ from typing import Dict, List, Optional, Tuple, Union
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+import openai
+from docx2python import docx2python
+import docx2txt
 
 # Configure page settings
 st.set_page_config(
@@ -41,6 +44,17 @@ def get_api_keys():
 api_keys = get_api_keys()
 YOUTUBE_API_KEY = api_keys["youtube_api_key"]
 OPENAI_API_KEY = api_keys["openai_api_key"]
+
+# Load angle_bot_prompt.txt
+def load_analysis_prompt():
+    try:
+        with open("angle_bot_prompt.txt", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        st.error(f"Error loading analysis prompt file: {str(e)}")
+        return "Analyze the transcript and comments from this YouTube video. Identify key themes, interesting insights, and what seems to resonate with viewers."
+
+ANALYSIS_PROMPT = load_analysis_prompt()
 
 # Create downloads directory if it doesn't exist
 os.makedirs("downloads", exist_ok=True)
@@ -326,6 +340,41 @@ def transcribe_with_whisper(audio_file_path, api_key):
         return {"success": True, "transcript": transcript_text}
     except Exception as e:
         return {"success": False, "error": f"Error transcribing audio with OpenAI: {str(e)}"}
+        
+# Function to extract text content from DOCX file
+def extract_text_from_docx(docx_path):
+    """Extract all text content from a DOCX file."""
+    try:
+        return docx2txt.process(docx_path)
+    except Exception as e:
+        st.error(f"Error extracting text from document: {str(e)}")
+        return None
+        
+# Function to analyze document with OpenAI's ChatGPT
+def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
+    """Analyze document content using ChatGPT."""
+    try:
+        openai.api_key = api_key
+        
+        # Combine the prompt and document text
+        full_prompt = f"{prompt_text}\n\nHere is the document containing the transcript and comments:\n\n{document_text}"
+        
+        # Make API call to ChatGPT
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo-16k",  # Using a model with larger context window
+            messages=[
+                {"role": "system", "content": "You are an expert analyst of YouTube video content and audience engagement."},
+                {"role": "user", "content": full_prompt}
+            ],
+            max_tokens=4000,
+            temperature=0.7
+        )
+        
+        # Extract and return the analysis
+        analysis = response.choices[0].message.content
+        return {"success": True, "analysis": analysis}
+    except Exception as e:
+        return {"success": False, "error": f"Error analyzing document with ChatGPT: {str(e)}"}
 
 # Function to create a Word document with transcript and comments
 def create_word_doc(video_info, transcript, comments, output_path="./downloads"):
@@ -505,6 +554,54 @@ if st.button("Process Videos (Download Audio, Generate Transcript & Comments)"):
                 )
                 
                 st.markdown(doc_link, unsafe_allow_html=True)
+                
+                # Optional: Analyze with ChatGPT
+                chatgpt_analysis = st.checkbox(f"Analyze this video with ChatGPT", key=f"analyze_{video_id}")
+                
+                if chatgpt_analysis:
+                    analysis_status = st.empty()
+                    analysis_status.info("Analyzing video content with ChatGPT...")
+                    
+                    # Extract text from document
+                    doc_text = extract_text_from_docx(doc_result["file_path"])
+                    
+                    if doc_text:
+                        # Analyze with ChatGPT
+                        analysis_result = analyze_document_with_chatgpt(
+                            doc_text, 
+                            ANALYSIS_PROMPT, 
+                            openai_api_key_input
+                        )
+                        
+                        if analysis_result["success"]:
+                            analysis_status.success("✅ Analysis completed successfully")
+                            
+                            # Display the analysis in a nice format
+                            st.subheader("ChatGPT Analysis")
+                            
+                            with st.expander("View Analysis", expanded=True):
+                                st.markdown(analysis_result["analysis"])
+                                
+                            # Create a download link for the analysis
+                            analysis_text = analysis_result["analysis"]
+                            analysis_filename = f"{safe_title}_analysis.txt"
+                            
+                            # Save analysis to file
+                            analysis_path = f"downloads/{analysis_filename}"
+                            with open(analysis_path, "w", encoding="utf-8") as f:
+                                f.write(analysis_text)
+                                
+                            # Create download link
+                            analysis_link = get_binary_file_downloader_html(
+                                analysis_path,
+                                analysis_filename
+                            )
+                            
+                            st.markdown(analysis_link, unsafe_allow_html=True)
+                        else:
+                            analysis_status.error(f"Error analyzing content: {analysis_result['error']}")
+                    else:
+                        analysis_status.error("Could not extract text from document for analysis.")
                 
                 # Add a divider between videos
                 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
