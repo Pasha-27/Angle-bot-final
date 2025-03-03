@@ -17,6 +17,10 @@ import openai
 from docx2python import docx2python
 import docx2txt
 
+# Initialize session state for storing processing state
+if 'processed_videos' not in st.session_state:
+    st.session_state.processed_videos = []
+
 # Configure page settings
 st.set_page_config(
     page_title="YouTube Downloader",
@@ -476,6 +480,9 @@ if st.button("Process Videos (Download Audio, Generate Transcript & Comments)"):
     elif len(video_urls) > 5:
         st.error("Please enter no more than 5 URLs. Processing multiple videos consumes significant API resources.")
     else:
+        # Clear previously processed videos
+        st.session_state.processed_videos = []
+        
         for url in video_urls:
             st.markdown(f"### Processing: {url}")
             with st.spinner(f"Processing {url} ..."):
@@ -553,55 +560,94 @@ if st.button("Process Videos (Download Audio, Generate Transcript & Comments)"):
                     f"{safe_title}_transcript_comments.docx"
                 )
                 
+                # Store processed video data in session state
+                st.session_state.processed_videos.append({
+                    "video_id": video_id,
+                    "title": video_info["title"],
+                    "safe_title": safe_title,
+                    "doc_path": doc_result["file_path"],
+                    "url": url
+                })
+                
                 st.markdown(doc_link, unsafe_allow_html=True)
                 
-                # Optional: Analyze with ChatGPT
-                chatgpt_analysis = st.checkbox(f"Analyze this video with ChatGPT", key=f"analyze_{video_id}")
+                # Initialize session state for this video if not exists
+                video_state_key = f"video_state_{video_id}"
+                if video_state_key not in st.session_state:
+                    st.session_state[video_state_key] = {
+                        "analyzed": False,
+                        "analysis_result": None,
+                        "show_analysis": False
+                    }
                 
-                if chatgpt_analysis:
-                    analysis_status = st.empty()
-                    analysis_status.info("Analyzing video content with ChatGPT...")
+                # Create a button for analysis instead of a checkbox
+                analyze_button_key = f"analyze_btn_{video_id}"
+                analyze_col, status_col = st.columns([1, 3])
+                
+                with analyze_col:
+                    if not st.session_state[video_state_key]["analyzed"]:
+                        if st.button("Analyze with ChatGPT", key=analyze_button_key):
+                            with status_col:
+                                analysis_status = st.empty()
+                                analysis_status.info("Analyzing video content with ChatGPT...")
+                                
+                                # Extract text from document
+                                doc_text = extract_text_from_docx(doc_result["file_path"])
+                                
+                                if doc_text:
+                                    # Analyze with ChatGPT
+                                    analysis_result = analyze_document_with_chatgpt(
+                                        doc_text, 
+                                        ANALYSIS_PROMPT, 
+                                        openai_api_key_input
+                                    )
+                                    
+                                    # Store in session state
+                                    st.session_state[video_state_key]["analyzed"] = True
+                                    st.session_state[video_state_key]["analysis_result"] = analysis_result
+                                    st.session_state[video_state_key]["show_analysis"] = True
+                                    
+                                    # Rerun to show results
+                                    st.experimental_rerun()
+                                else:
+                                    analysis_status.error("Could not extract text from document for analysis.")
+                    else:
+                        # Already analyzed, show toggle button
+                        if st.button("Show/Hide Analysis", key=f"toggle_{video_id}"):
+                            st.session_state[video_state_key]["show_analysis"] = not st.session_state[video_state_key]["show_analysis"]
+                            st.experimental_rerun()
+                
+                # Display analysis if available and show_analysis is True
+                if st.session_state[video_state_key]["analyzed"] and st.session_state[video_state_key]["show_analysis"]:
+                    analysis_result = st.session_state[video_state_key]["analysis_result"]
                     
-                    # Extract text from document
-                    doc_text = extract_text_from_docx(doc_result["file_path"])
-                    
-                    if doc_text:
-                        # Analyze with ChatGPT
-                        analysis_result = analyze_document_with_chatgpt(
-                            doc_text, 
-                            ANALYSIS_PROMPT, 
-                            openai_api_key_input
+                    if analysis_result["success"]:
+                        status_col.success("✅ Analysis completed successfully")
+                        
+                        # Display the analysis in a nice format
+                        st.subheader("ChatGPT Analysis")
+                        
+                        with st.expander("View Analysis", expanded=True):
+                            st.markdown(analysis_result["analysis"])
+                            
+                        # Create a download link for the analysis
+                        analysis_text = analysis_result["analysis"]
+                        analysis_filename = f"{safe_title}_analysis.txt"
+                        
+                        # Save analysis to file
+                        analysis_path = f"downloads/{analysis_filename}"
+                        with open(analysis_path, "w", encoding="utf-8") as f:
+                            f.write(analysis_text)
+                            
+                        # Create download link
+                        analysis_link = get_binary_file_downloader_html(
+                            analysis_path,
+                            analysis_filename
                         )
                         
-                        if analysis_result["success"]:
-                            analysis_status.success("✅ Analysis completed successfully")
-                            
-                            # Display the analysis in a nice format
-                            st.subheader("ChatGPT Analysis")
-                            
-                            with st.expander("View Analysis", expanded=True):
-                                st.markdown(analysis_result["analysis"])
-                                
-                            # Create a download link for the analysis
-                            analysis_text = analysis_result["analysis"]
-                            analysis_filename = f"{safe_title}_analysis.txt"
-                            
-                            # Save analysis to file
-                            analysis_path = f"downloads/{analysis_filename}"
-                            with open(analysis_path, "w", encoding="utf-8") as f:
-                                f.write(analysis_text)
-                                
-                            # Create download link
-                            analysis_link = get_binary_file_downloader_html(
-                                analysis_path,
-                                analysis_filename
-                            )
-                            
-                            st.markdown(analysis_link, unsafe_allow_html=True)
-                        else:
-                            analysis_status.error(f"Error analyzing content: {analysis_result['error']}")
+                        st.markdown(analysis_link, unsafe_allow_html=True)
                     else:
-                        analysis_status.error("Could not extract text from document for analysis.")
+                        st.error(f"Error analyzing content: {analysis_result['error']}")
                 
                 # Add a divider between videos
                 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
