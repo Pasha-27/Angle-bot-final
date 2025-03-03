@@ -449,7 +449,7 @@ with st.container():
         if st.button("Clear Results"):
             for key in ['comments', 'video_info', 'commentCount', 'is_fetching_comments', "page_num"]:
                 st.session_state.pop(key, None)
-            st.experimental_rerun()
+            # Removing experimental_rerun() here; the state is cleared and next interaction will update the UI.
     st.markdown('</div>', unsafe_allow_html=True)
     
     col1, col2 = st.columns([3, 1])
@@ -459,7 +459,7 @@ with st.container():
         if "is_fetching_comments" in st.session_state and st.session_state["is_fetching_comments"]:
             if st.button("Cancel Fetching"):
                 st.session_state["cancel_fetch"] = True
-                st.stop()  # End current run so that the cancel flag takes effect
+                st.stop()
 
     if "cancel_fetch" not in st.session_state:
         st.session_state["cancel_fetch"] = False
@@ -530,7 +530,7 @@ with st.container():
                                 else:
                                     status_text.success(f"Successfully fetched {len(all_comments):,} comments!")
                                 st.session_state["is_fetching_comments"] = False
-                                st.experimental_rerun()
+                                # Removed st.experimental_rerun() here so the UI updates naturally based on session state.
         else:
             st.warning("Please enter a valid YouTube URL.")
 
@@ -593,7 +593,6 @@ with st.container():
                 with col1:
                     st.write(f"Total pages: {total_pages}")
                 with col2:
-                    # Use the stored page number from session state
                     page_num = st.selectbox("Page", range(1, total_pages + 1), index=st.session_state["page_num"] - 1)
                     st.session_state["page_num"] = page_num
             else:
