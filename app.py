@@ -1,4 +1,92 @@
-import streamlit as st
+def get_all_comments_with_callback(video_id: str, api_key: str, 
+                              progress_callback=None, progress_bar=None, status_text=None) -> List[Dict]:
+    """Fetch all comments by paging through results with progress callback."""
+    all_comments = []
+    next_page_token = None
+    page_num = 1
+    max_pages = 500  # Safety limit for extremely popular videos
+    error_count = 0
+    max_errors = 3  # Maximum consecutive errors before giving up
+    
+    while True and page_num <= max_pages:
+        # Update progress status
+        if status_text:
+            status_text.text(f"Fetching page {page_num} of comments...")
+        
+        # Check if operation should be canceled
+        if progress_callback and progress_callback(len(all_comments), page_num):
+            if status_text:
+                status_text.warning("Operation canceled by user.")
+            break
+        
+        try:
+            # Fetch comments for current page
+            result = get_comments(video_id, api_key, next_page_token)
+            
+            if not result["success"]:
+                error_count += 1
+                error_message = result.get('error', 'Unknown error')
+                
+                if error_count >= max_errors:
+                    if status_text:
+                        status_text.error(f"Too many errors: {error_message}. Stopping comment retrieval.")
+                    break
+                
+                if "quota" in error_message.lower():
+                    if status_text:
+                        status_text.error(f"API quota exceeded: {error_message}")
+                    break
+                
+                if status_text:
+                    status_text.warning(f"Error on page {page_num}: {error_message}. Retrying in 2 seconds...")
+                
+                # Wait longer before retry for rate limiting issues
+                time.sleep(2)
+                continue
+            
+            # Reset error counter on success
+            error_count = 0
+            
+            # Process comments from current page
+            comments, next_page_token = process_comment_data(result["data"])
+            all_comments.extend(comments)
+            
+            # Update progress via callback if provided
+            if progress_callback:
+                if progress_callback(len(all_comments), page_num):
+                    if status_text:
+                        status_text.warning("Operation canceled by user.")
+                    break
+            
+            # Display warning for large comment retrieval
+            if page_num % 5 == 0 and status_text:
+                status_text.info(f"Downloaded {len(all_comments)} comments so far (on page {page_num})...")
+            
+            # Check if we've reached the last page
+            if not next_page_token:
+                break
+            
+            # Add a small delay to avoid rate limiting
+            time.sleep(0.5)
+            page_num += 1
+            
+            # Safety check for extremely large comment sets
+            if page_num == max_pages and status_text:
+                status_text.warning(f"Reached maximum page limit ({max_pages}). Some comments may not be retrieved.")
+        
+        except Exception as e:
+            error_count += 1
+            if status_text:
+                status_text.warning(f"Unexpected error on page {page_num}: {str(e)}. Retrying...")
+            
+            if error_count >= max_errors:
+                if status_text:
+                    status_text.error(f"Too many consecutive errors. Stopping comment retrieval.")
+                break
+            
+            time.sleep(2)  # Wait before retry
+    
+    return all_commentsimport streamlit as st
 import requests
 import pandas as pd
 import re
@@ -402,15 +490,12 @@ def create_download_link(df: pd.DataFrame, filename: str, link_text: str) -> str
 st.markdown('<h1 class="highlight">YouTube Comments Downloader</h1>', unsafe_allow_html=True)
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-# Sidebar for API key and options
+    # Sidebar for options only (no API key input)
 with st.sidebar:
     st.markdown('<h3>⚙️ Settings</h3>', unsafe_allow_html=True)
     
-    api_key = st.text_input(
-        "YouTube API Key",
-        type="password",
-        help="Get your API key from the Google Developer Console"
-    )
+    # Inform user about API key usage
+    st.success("✅ Using YouTube API key from secrets")
     
     st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
     
@@ -506,6 +591,18 @@ with st.container():
                     
                     progress_bar = st.progress(0)
                     status_text = st.empty()
+                    comment_count_text = st.empty()
+                    
+                    # Create a more detailed progress display
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        eta_display = st.empty()
+                    with col2:
+                        fetch_rate_display = st.empty()
+                    
+                    # Initialize session state for tracking progress
+                    st.session_state["comment_fetch_start_time"] = time.time()
+                    st.session_state["comments_fetched_so_far"] = 0
                     
                     status_text.text(f"Fetching comments... This might take a while for videos with many comments.")
                     
