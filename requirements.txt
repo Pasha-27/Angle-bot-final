@@ -6,4 +6,6 @@ typing-extensions>=4.4.0
 python-docx>=0.8.11
 openai==0.28
 python-dotenv>=1.0.0
+docx2python>=1.0.0
+docx2txt>=0.8
 yt-dlp
