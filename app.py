@@ -1,92 +1,4 @@
-def get_all_comments_with_callback(video_id: str, api_key: str, 
-                              progress_callback=None, progress_bar=None, status_text=None) -> List[Dict]:
-    """Fetch all comments by paging through results with progress callback."""
-    all_comments = []
-    next_page_token = None
-    page_num = 1
-    max_pages = 500  # Safety limit for extremely popular videos
-    error_count = 0
-    max_errors = 3  # Maximum consecutive errors before giving up
-    
-    while True and page_num <= max_pages:
-        # Update progress status
-        if status_text:
-            status_text.text(f"Fetching page {page_num} of comments...")
-        
-        # Check if operation should be canceled
-        if progress_callback and progress_callback(len(all_comments), page_num):
-            if status_text:
-                status_text.warning("Operation canceled by user.")
-            break
-        
-        try:
-            # Fetch comments for current page
-            result = get_comments(video_id, api_key, next_page_token)
-            
-            if not result["success"]:
-                error_count += 1
-                error_message = result.get('error', 'Unknown error')
-                
-                if error_count >= max_errors:
-                    if status_text:
-                        status_text.error(f"Too many errors: {error_message}. Stopping comment retrieval.")
-                    break
-                
-                if "quota" in error_message.lower():
-                    if status_text:
-                        status_text.error(f"API quota exceeded: {error_message}")
-                    break
-                
-                if status_text:
-                    status_text.warning(f"Error on page {page_num}: {error_message}. Retrying in 2 seconds...")
-                
-                # Wait longer before retry for rate limiting issues
-                time.sleep(2)
-                continue
-            
-            # Reset error counter on success
-            error_count = 0
-            
-            # Process comments from current page
-            comments, next_page_token = process_comment_data(result["data"])
-            all_comments.extend(comments)
-            
-            # Update progress via callback if provided
-            if progress_callback:
-                if progress_callback(len(all_comments), page_num):
-                    if status_text:
-                        status_text.warning("Operation canceled by user.")
-                    break
-            
-            # Display warning for large comment retrieval
-            if page_num % 5 == 0 and status_text:
-                status_text.info(f"Downloaded {len(all_comments)} comments so far (on page {page_num})...")
-            
-            # Check if we've reached the last page
-            if not next_page_token:
-                break
-            
-            # Add a small delay to avoid rate limiting
-            time.sleep(0.5)
-            page_num += 1
-            
-            # Safety check for extremely large comment sets
-            if page_num == max_pages and status_text:
-                status_text.warning(f"Reached maximum page limit ({max_pages}). Some comments may not be retrieved.")
-        
-        except Exception as e:
-            error_count += 1
-            if status_text:
-                status_text.warning(f"Unexpected error on page {page_num}: {str(e)}. Retrying...")
-            
-            if error_count >= max_errors:
-                if status_text:
-                    status_text.error(f"Too many consecutive errors. Stopping comment retrieval.")
-                break
-            
-            time.sleep(2)  # Wait before retry
-    
-    return all_commentsimport streamlit as st
+import streamlit as st
 import requests
 import pandas as pd
 import re
@@ -107,7 +19,26 @@ st.set_page_config(
     }
 )
 
-    # Apply custom CSS for dark mode and modern UI
+# Load API keys from st.secrets if available
+@st.cache_resource
+def get_api_keys():
+    config = {"youtube_api_key": None}
+    try:
+        if "YOUTUBE_API_KEY" in st.secrets:
+            config["youtube_api_key"] = st.secrets["YOUTUBE_API_KEY"]
+    except Exception:
+        pass
+    return config
+
+api_keys = get_api_keys()
+YOUTUBE_API_KEY = api_keys["youtube_api_key"]
+
+# Verify that API key exists
+if not YOUTUBE_API_KEY:
+    st.error("⚠️ YouTube API key not found in secrets. Please add it to your .streamlit/secrets.toml file.")
+    st.stop()
+
+# Apply custom CSS for dark mode and modern UI
 st.markdown("""
 <style>
     /* Dark mode theme */
@@ -392,8 +323,9 @@ def get_video_info(video_id: str, api_key: str) -> Dict:
         "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", "")
     }
 
-def get_all_comments(video_id: str, api_key: str, progress_bar=None, status_text=None) -> List[Dict]:
-    """Fetch all comments by paging through results."""
+def get_all_comments_with_callback(video_id: str, api_key: str, 
+                              progress_callback=None, progress_bar=None, status_text=None) -> List[Dict]:
+    """Fetch all comments by paging through results with progress callback."""
     all_comments = []
     next_page_token = None
     page_num = 1
@@ -405,6 +337,12 @@ def get_all_comments(video_id: str, api_key: str, progress_bar=None, status_text
         # Update progress status
         if status_text:
             status_text.text(f"Fetching page {page_num} of comments...")
+        
+        # Check if operation should be canceled
+        if progress_callback and progress_callback(len(all_comments), page_num):
+            if status_text:
+                status_text.warning("Operation canceled by user.")
+            break
         
         try:
             # Fetch comments for current page
@@ -438,20 +376,16 @@ def get_all_comments(video_id: str, api_key: str, progress_bar=None, status_text
             comments, next_page_token = process_comment_data(result["data"])
             all_comments.extend(comments)
             
-            # Update progress
-            if progress_bar and "commentCount" in st.session_state:
-                try:
-                    total_comments = int(st.session_state["commentCount"])
-                    if total_comments > 0:
-                        progress = min(1.0, len(all_comments) / total_comments)
-                        progress_bar.progress(progress)
-                except (ValueError, TypeError):
-                    # If commentCount is invalid, show progress based on pages
-                    progress_bar.progress(min(1.0, page_num / 50))
+            # Update progress via callback if provided
+            if progress_callback:
+                if progress_callback(len(all_comments), page_num):
+                    if status_text:
+                        status_text.warning("Operation canceled by user.")
+                    break
             
             # Display warning for large comment retrieval
-            if page_num % 10 == 0 and status_text:
-                status_text.info(f"Downloaded {len(all_comments)} comments so far...")
+            if page_num % 5 == 0 and status_text:
+                status_text.info(f"Downloaded {len(all_comments)} comments so far (on page {page_num})...")
             
             # Check if we've reached the last page
             if not next_page_token:
@@ -490,7 +424,7 @@ def create_download_link(df: pd.DataFrame, filename: str, link_text: str) -> str
 st.markdown('<h1 class="highlight">YouTube Comments Downloader</h1>', unsafe_allow_html=True)
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-    # Sidebar for options only (no API key input)
+# Sidebar for options only (no API key input)
 with st.sidebar:
     st.markdown('<h3>⚙️ Settings</h3>', unsafe_allow_html=True)
     
@@ -543,15 +477,130 @@ with st.container():
     with col2:
         if st.button("Clear Results"):
             # Reset session state to clear results
-            for key in ['comments', 'video_info', 'commentCount']:
+            for key in ['comments', 'video_info', 'commentCount', 'is_fetching_comments']:
                 if key in st.session_state:
                     del st.session_state[key]
             st.experimental_rerun()
             
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Button to show all comments - separate from the download flow
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        fetch_comments_button = st.button("Fetch All Comments", type="primary")
+    with col2:
+        if "is_fetching_comments" in st.session_state and st.session_state["is_fetching_comments"]:
+            if st.button("Cancel Fetching"):
+                st.session_state["cancel_fetch"] = True
+                st.experimental_rerun()
+
+    # Initialize cancel flag in session state if not present
+    if "cancel_fetch" not in st.session_state:
+        st.session_state["cancel_fetch"] = False
+
+    # Handle comment fetching
+    if fetch_comments_button:
+        if youtube_url:
+            video_id = extract_video_id(youtube_url)
+            if not video_id:
+                st.error("Could not extract video ID from the URL.")
+            else:
+                # Use YouTube API key from secrets directly
+                youtube_api_key = YOUTUBE_API_KEY
+                
+                if not youtube_api_key:
+                    st.error("YouTube API key not found in secrets. Please add it to your .streamlit/secrets.toml file.")
+                else:
+                    # Set fetching state
+                    st.session_state["is_fetching_comments"] = True
+                    st.session_state["cancel_fetch"] = False
+                    
+                    # Create progress indicators
+                    progress_container = st.container()
+                    with progress_container:
+                        st.markdown("### Fetching All Comments")
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        comment_count_text = st.empty()
+                        
+                        # Create a more detailed progress display
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            time_elapsed = st.empty()
+                        with col2:
+                            speed_indicator = st.empty()
+                        
+                        st.session_state["comment_fetch_start_time"] = time.time()
+                        st.session_state["comments_fetched_so_far"] = 0
+                        
+                        # Show initial message
+                        status_text.info("Starting to fetch comments... Please wait.")
+                                            
+                        # First get video info to know comment count
+                        video_info = get_video_info(video_id, youtube_api_key)
+                        if not video_info["success"]:
+                            status_text.error(f"Error: {video_info.get('error', 'Unable to fetch video information')}")
+                        else:
+                            # Store video info in session state
+                            st.session_state["video_info"] = video_info
+                            
+                            # Store comment count for progress tracking
+                            total_comments = int(video_info["comment_count"])
+                            comment_count_text.write(f"Total comments to fetch: {total_comments:,}")
+                            
+                            # Create function for updating progress
+                            def update_progress_callback(comments_fetched, page_num):
+                                elapsed = time.time() - st.session_state["comment_fetch_start_time"]
+                                comments_per_second = comments_fetched / max(1, elapsed)
+                                
+                                # Update progress bar
+                                if total_comments > 0:
+                                    progress = min(0.99, comments_fetched / total_comments)
+                                    progress_bar.progress(progress)
+                                
+                                # Update status texts
+                                time_elapsed.write(f"Time elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s")
+                                speed_indicator.write(f"Speed: {comments_per_second:.1f} comments/sec")
+                                comment_count_text.write(f"Fetched {comments_fetched:,} of {total_comments:,} comments (Page {page_num})")
+                                
+                                # Check if operation was canceled
+                                return st.session_state.get("cancel_fetch", False)
+                            
+                            # Start actual comment fetching with callback
+                            all_comments = get_all_comments_with_callback(video_id, youtube_api_key, 
+                                                                        update_progress_callback, 
+                                                                        progress_bar, status_text)
+                            
+                            # Finalize
+                            if st.session_state.get("cancel_fetch", False):
+                                status_text.warning("Comment fetching was canceled.")
+                                if len(all_comments) > 0:
+                                    st.session_state["comments"] = all_comments
+                                    st.success(f"Fetched {len(all_comments):,} comments before canceling.")
+                                    st.experimental_rerun()
+                            else:
+                                # Store in session state
+                                st.session_state["comments"] = all_comments
+                                
+                                # Show final status
+                                progress_bar.progress(1.0)
+                                if len(all_comments) == 0:
+                                    status_text.error("No comments were retrieved. The video might have comments disabled.")
+                                elif len(all_comments) < total_comments * 0.5 and total_comments > 10:
+                                    status_text.warning(f"Downloaded {len(all_comments):,} comments, but the video has approximately {total_comments:,} comments. Some comments may be missing due to API limitations.")
+                                else:
+                                    status_text.success(f"Successfully fetched {len(all_comments):,} comments!")
+                                
+                                # Clear fetching state
+                                st.session_state["is_fetching_comments"] = False
+                                
+                                # Rerun to show the comments
+                                st.experimental_rerun()
+        else:
+            st.warning("Please enter a valid YouTube URL.")
+
     # Process video when the button is clicked
-    if process_button and youtube_url and api_key:
+    if process_button and youtube_url:
         # Extract video ID
         video_id = extract_video_id(youtube_url)
         
@@ -560,7 +609,7 @@ with st.container():
         else:
             # Get video information first
             with st.spinner("Fetching video information..."):
-                video_info = get_video_info(video_id, api_key)
+                video_info = get_video_info(video_id, YOUTUBE_API_KEY)
                 
                 if not video_info["success"]:
                     st.error(f"Error: {video_info.get('error', 'Unable to fetch video information')}")
@@ -584,51 +633,9 @@ with st.container():
                         st.markdown(f"**Comments:** {int(video_info['comment_count']):,}")
                     
                     st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Fetch all comments with progress tracking
-                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-                    st.markdown("### Downloading Comments")
-                    
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    comment_count_text = st.empty()
-                    
-                    # Create a more detailed progress display
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        eta_display = st.empty()
-                    with col2:
-                        fetch_rate_display = st.empty()
-                    
-                    # Initialize session state for tracking progress
-                    st.session_state["comment_fetch_start_time"] = time.time()
-                    st.session_state["comments_fetched_so_far"] = 0
-                    
-                    status_text.text(f"Fetching comments... This might take a while for videos with many comments.")
-                    
-                    # Get all comments
-                    all_comments = get_all_comments(video_id, api_key, progress_bar, status_text)
-                    
-                    # Store in session state
-                    st.session_state["comments"] = all_comments
-                    
-                    # Update status
-                    progress_bar.progress(1.0)
-                    
-                    if len(all_comments) == 0:
-                        status_text.error("No comments were retrieved. The video might have comments disabled.")
-                    elif len(all_comments) < int(video_info["comment_count"]) * 0.5 and int(video_info["comment_count"]) > 10:
-                        # If we retrieved less than 50% of the expected comments
-                        status_text.warning(f"Downloaded {len(all_comments)} comments, but the video has approximately {video_info['comment_count']} comments. Some comments may be missing due to API limitations.")
-                    else:
-                        status_text.success(f"Downloaded {len(all_comments)} comments successfully!")
-                        
-                    # Add explanation if needed
-                    if int(video_info["comment_count"]) > 10000:
-                        st.info("⚠️ Note: For videos with a very large number of comments, YouTube's API may not return all historical comments.")
-    
+
     # Display fetched comments if available
-    if "comments" in st.session_state and "video_info" in st.session_state:
+    if "comments" in st.session_state and st.session_state["comments"]:
         st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
         st.markdown("### Comments")
         
@@ -662,16 +669,17 @@ with st.container():
                 df_comments["publishedAt"] = df_comments["publishedAt"].apply(format_timestamp)
             
             # Generate download buttons
-            video_title = st.session_state["video_info"]["title"]
-            safe_title = re.sub(r'[^\w\s-]', '', video_title).strip().replace(' ', '_')
-            filename = f"{safe_title}_comments.csv"
+            if "video_info" in st.session_state:
+                video_title = st.session_state["video_info"]["title"]
+                safe_title = re.sub(r'[^\w\s-]', '', video_title).strip().replace(' ', '_')
+                filename = f"{safe_title}_comments.csv"
+                
+                st.markdown(
+                    create_download_link(df_comments, filename, "Download All Comments as CSV"),
+                    unsafe_allow_html=True
+                )
             
-            st.markdown(
-                create_download_link(df_comments, filename, "Download as CSV"),
-                unsafe_allow_html=True
-            )
-            
-            # Display comments - showing all comments in the UI
+            # Display comments with pagination
             if filtered_comments:
                 # Add pagination for better performance
                 items_per_page = 50
@@ -680,12 +688,11 @@ with st.container():
                 if total_pages > 1:
                     col1, col2 = st.columns([3, 1])
                     with col1:
-                        st.write(f"Total comments: {len(filtered_comments)}")
+                        st.write(f"Total pages: {total_pages}")
                     with col2:
                         page_num = st.selectbox("Page", range(1, total_pages + 1), index=0)
                 else:
                     page_num = 1
-                    st.write(f"Total comments: {len(filtered_comments)}")
                 
                 start_idx = (page_num - 1) * items_per_page
                 end_idx = min(start_idx + items_per_page, len(filtered_comments))
@@ -697,6 +704,8 @@ with st.container():
                     st.warning("⚠️ This video has a large number of comments. The UI might be slower to respond.")
                 
                 # Display comments for this page
+                st.markdown(f"**Showing comments {start_idx+1}-{end_idx} of {len(filtered_comments)}**")
+                
                 for i, comment in enumerate(page_comments):
                     # Determine if it's a reply
                     indent = "" if not comment["isReply"] else "↪️ "
@@ -719,22 +728,22 @@ with st.container():
                     cols = st.columns([1, 1, 1, 1])
                     with cols[0]:
                         if page_num > 1:
-                            if st.button("⏮️ First"):
+                            if st.button("⏮️ First", key="first_btn"):
                                 st.session_state["page_num"] = 1
                                 st.experimental_rerun()
                     with cols[1]:
                         if page_num > 1:
-                            if st.button("◀️ Previous"):
+                            if st.button("◀️ Previous", key="prev_btn"):
                                 st.session_state["page_num"] = page_num - 1
                                 st.experimental_rerun()
                     with cols[2]:
                         if page_num < total_pages:
-                            if st.button("Next ▶️"):
+                            if st.button("Next ▶️", key="next_btn"):
                                 st.session_state["page_num"] = page_num + 1
                                 st.experimental_rerun()
                     with cols[3]:
                         if page_num < total_pages:
-                            if st.button("Last ⏭️"):
+                            if st.button("Last ⏭️", key="last_btn"):
                                 st.session_state["page_num"] = total_pages
                                 st.experimental_rerun()
             else:
