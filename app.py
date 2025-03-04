@@ -13,13 +13,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-import openai
-from docx2python import docx2python
 import docx2txt
-
-# Initialize session state for storing processing state
-if 'processed_videos' not in st.session_state:
-    st.session_state.processed_videos = []
 
 # Configure page settings
 st.set_page_config(
@@ -31,6 +25,16 @@ st.set_page_config(
         'About': "# YouTube Downloader\nDownload comments and transcripts from multiple YouTube videos."
     }
 )
+
+# Initialize session state for persistence across reruns
+if 'processed_videos' not in st.session_state:
+    st.session_state.processed_videos = []
+
+if 'analyzing_video' not in st.session_state:
+    st.session_state.analyzing_video = None
+
+if 'analysis_results' not in st.session_state:
+    st.session_state.analysis_results = {}
 
 # Load API keys from st.secrets if available
 @st.cache_resource
@@ -49,19 +53,19 @@ api_keys = get_api_keys()
 YOUTUBE_API_KEY = api_keys["youtube_api_key"]
 OPENAI_API_KEY = api_keys["openai_api_key"]
 
+# Create downloads directory if it doesn't exist
+os.makedirs("downloads", exist_ok=True)
+
 # Load angle_bot_prompt.txt
 def load_analysis_prompt():
     try:
         with open("angle_bot_prompt.txt", "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
-        st.error(f"Error loading analysis prompt file: {str(e)}")
+        st.warning(f"Could not load angle_bot_prompt.txt: {str(e)}. Using default prompt.")
         return "Analyze the transcript and comments from this YouTube video. Identify key themes, interesting insights, and what seems to resonate with viewers."
 
 ANALYSIS_PROMPT = load_analysis_prompt()
-
-# Create downloads directory if it doesn't exist
-os.makedirs("downloads", exist_ok=True)
 
 # Apply custom CSS for dark mode and modern UI
 st.markdown("""
@@ -270,13 +274,6 @@ def get_all_comments_with_callback(video_id: str, api_key: str, status_text=None
         page_num += 1
     return all_comments
 
-# Helper function: create a download link for a DataFrame as CSV
-def create_download_link(df: pd.DataFrame, filename: str, link_text: str) -> str:
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" class="download-button">{link_text}</a>'
-    return href
-
 # Function to download audio from a YouTube video
 def download_youtube_audio(youtube_url, output_path="./downloads", format="mp3", quality="192"):
     """Download audio from a YouTube video using yt-dlp."""
@@ -358,6 +355,7 @@ def extract_text_from_docx(docx_path):
 def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
     """Analyze document content using ChatGPT."""
     try:
+        import openai
         openai.api_key = api_key
         
         # Combine the prompt and document text
@@ -428,6 +426,42 @@ def create_word_doc(video_info, transcript, comments, output_path="./downloads")
     except Exception as e:
         return {"success": False, "error": f"Error creating Word document: {str(e)}"}
 
+# Function to handle the analysis of a document
+def handle_analyze_document(video_id, doc_path, safe_title):
+    try:
+        # Extract text from document
+        doc_text = extract_text_from_docx(doc_path)
+        
+        if not doc_text:
+            return {"success": False, "error": "Could not extract text from document"}
+        
+        # Analyze with ChatGPT
+        analysis_result = analyze_document_with_chatgpt(
+            doc_text, 
+            ANALYSIS_PROMPT, 
+            OPENAI_API_KEY or st.session_state.get("openai_key", "")
+        )
+        
+        if analysis_result["success"]:
+            # Save analysis to file
+            analysis_text = analysis_result["analysis"]
+            analysis_filename = f"{safe_title}_analysis.txt"
+            analysis_path = f"downloads/{analysis_filename}"
+            
+            with open(analysis_path, "w", encoding="utf-8") as f:
+                f.write(analysis_text)
+                
+            return {
+                "success": True, 
+                "analysis": analysis_result["analysis"],
+                "analysis_path": analysis_path,
+                "analysis_filename": analysis_filename
+            }
+        else:
+            return analysis_result
+    except Exception as e:
+        return {"success": False, "error": f"Error during analysis: {str(e)}"}
+
 # Main Application UI
 st.markdown('<h1 class="highlight">YouTube Comments & Transcript Downloader</h1>', unsafe_allow_html=True)
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
@@ -441,7 +475,8 @@ with st.expander("API Keys (Required)", expanded=not (YOUTUBE_API_KEY and OPENAI
             "YouTube API Key", 
             value=YOUTUBE_API_KEY if YOUTUBE_API_KEY else "",
             type="password", 
-            help="Required for fetching video info and comments"
+            help="Required for fetching video info and comments",
+            key="youtube_key"
         )
     
     with col2:
@@ -449,205 +484,243 @@ with st.expander("API Keys (Required)", expanded=not (YOUTUBE_API_KEY and OPENAI
             "OpenAI API Key", 
             value=OPENAI_API_KEY if OPENAI_API_KEY else "",
             type="password", 
-            help="Required for audio transcription with Whisper"
+            help="Required for audio transcription with Whisper and analysis with ChatGPT",
+            key="openai_key"
         )
     
     if not youtube_api_key_input:
         st.warning("⚠️ YouTube API key is required.")
     
     if not openai_api_key_input:
-        st.warning("⚠️ OpenAI API key is required for transcription.")
+        st.warning("⚠️ OpenAI API key is required for transcription and analysis.")
 
-# Input area for multiple YouTube video URLs
-st.markdown("### Enter up to 5 YouTube video URLs (one per line):")
-video_urls_text = st.text_area("YouTube Video URLs", placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...")
+# Create tabs for different sections of the app
+tab1, tab2 = st.tabs(["Process Videos", "Analyze Videos"])
 
-if st.button("Process Videos (Download Audio, Generate Transcript & Comments)"):
-    # Validate API keys
-    if not youtube_api_key_input:
-        st.error("YouTube API key is required. Please enter your API key in the section above.")
-        st.stop()
+with tab1:
+    # Input area for multiple YouTube video URLs
+    st.markdown("### Enter up to 5 YouTube video URLs (one per line):")
+    video_urls_text = st.text_area(
+        "YouTube Video URLs", 
+        placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...",
+        key="video_urls"
+    )
     
-    if not openai_api_key_input:
-        st.error("OpenAI API key is required for transcription. Please enter your API key in the section above.")
-        st.stop()
-    
-    # Split the input text into lines and take up to 5 non-empty URLs
-    video_urls = [url.strip() for url in video_urls_text.splitlines() if url.strip()]
-    
-    if not video_urls:
-        st.error("Please enter at least one YouTube URL.")
-    elif len(video_urls) > 5:
-        st.error("Please enter no more than 5 URLs. Processing multiple videos consumes significant API resources.")
-    else:
-        # Clear previously processed videos
-        st.session_state.processed_videos = []
+    # Process button
+    if st.button("Process Videos", key="process_btn"):
+        # Validate API keys
+        if not youtube_api_key_input:
+            st.error("YouTube API key is required. Please enter your API key in the API Keys section.")
+            st.stop()
         
-        for url in video_urls:
-            st.markdown(f"### Processing: {url}")
-            with st.spinner(f"Processing {url} ..."):
-                video_id = extract_video_id(url)
-                if not video_id:
-                    st.error(f"Could not extract video ID from the URL: {url}")
-                    continue
+        if not openai_api_key_input:
+            st.error("OpenAI API key is required. Please enter your API key in the API Keys section.")
+            st.stop()
+        
+        # Split the input text into lines and take up to 5 non-empty URLs
+        video_urls = [url.strip() for url in video_urls_text.splitlines() if url.strip()]
+        
+        if not video_urls:
+            st.error("Please enter at least one YouTube URL.")
+        elif len(video_urls) > 5:
+            st.error("Please enter no more than 5 URLs. Processing multiple videos consumes significant API resources.")
+        else:
+            # Clear previously processed videos
+            st.session_state.processed_videos = []
+            
+            for url in video_urls:
+                with st.spinner(f"Processing {url} ..."):
+                    video_id = extract_video_id(url)
+                    if not video_id:
+                        st.error(f"Could not extract video ID from the URL: {url}")
+                        continue
+                    
+                    # Step 1: Fetch video info
+                    video_info = get_video_info(video_id, youtube_api_key_input)
+                    if not video_info.get("success"):
+                        st.error(f"Error fetching video info: {video_info.get('error', 'Unknown error')}")
+                        continue
+                    
+                    # Display video info
+                    st.subheader(f"📺 {video_info['title']}")
+                    st.write(f"Channel: {video_info['channel']}")
+                    st.write(f"View Count: {int(video_info['view_count']):,}")
+                    
+                    # Step 2: Download audio
+                    audio_status = st.empty()
+                    audio_status.info("Downloading audio...")
+                    audio_result = download_youtube_audio(url)
+                    
+                    if not audio_result.get("success"):
+                        st.error(f"Error downloading audio: {audio_result.get('error', 'Unknown error')}")
+                        continue
+                    
+                    audio_status.success("✅ Audio downloaded successfully")
+                    
+                    # Step 3: Generate transcript with Whisper
+                    transcript_status = st.empty()
+                    transcript_status.info("Generating transcript with OpenAI Whisper...")
+                    
+                    transcript_result = transcribe_with_whisper(audio_result["file_path"], openai_api_key_input)
+                    
+                    if not transcript_result.get("success"):
+                        st.error(f"Error generating transcript: {transcript_result.get('error', 'Unknown error')}")
+                        continue
+                    
+                    transcript_status.success("✅ Transcript generated successfully")
+                    
+                    # Step 4: Fetch all comments
+                    comment_status = st.empty()
+                    comment_status.info("Fetching comments...")
+                    
+                    comments = get_all_comments_with_callback(video_id, youtube_api_key_input, status_text=comment_status)
+                    
+                    if not comments:
+                        comment_status.warning("No comments retrieved or comments are disabled for this video.")
+                        # Continue processing even if no comments are found
+                    else:
+                        comment_status.success(f"✅ Fetched {len(comments):,} comments")
+                    
+                    # Step 5: Create Word document with transcript and comments
+                    doc_status = st.empty()
+                    doc_status.info("Creating Word document...")
+                    
+                    doc_result = create_word_doc(
+                        video_info, 
+                        transcript_result["transcript"], 
+                        comments
+                    )
+                    
+                    if not doc_result.get("success"):
+                        st.error(f"Error creating document: {doc_result.get('error', 'Unknown error')}")
+                        continue
+                    
+                    doc_status.success("✅ Word document created successfully")
+                    
+                    # Create download link for the Word document
+                    safe_title = clean_filename(video_info["title"])
+                    doc_link = get_binary_file_downloader_html(
+                        doc_result["file_path"], 
+                        f"Download: {safe_title}_transcript_comments.docx"
+                    )
+                    
+                    st.markdown(doc_link, unsafe_allow_html=True)
+                    
+                    # Store processed video in session state
+                    st.session_state.processed_videos.append({
+                        "video_id": video_id,
+                        "title": video_info["title"],
+                        "safe_title": safe_title,
+                        "doc_path": doc_result["file_path"],
+                        "url": url
+                    })
+                    
+                    # Add a divider between videos
+                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+            
+            # Show a message if videos were processed successfully
+            if st.session_state.processed_videos:
+                st.success(f"✅ Processed {len(st.session_state.processed_videos)} videos successfully! Go to the 'Analyze Videos' tab to analyze them.")
+
+with tab2:
+    # Function to handle the Analyze button click
+    def on_analyze_click(video_idx):
+        st.session_state.analyzing_video = video_idx
+    
+    # Display processed videos for analysis
+    if not st.session_state.processed_videos:
+        st.info("No videos have been processed yet. Please go to the 'Process Videos' tab to process videos first.")
+    else:
+        st.markdown("### Analyze Processed Videos")
+        
+        for idx, video_data in enumerate(st.session_state.processed_videos):
+            with st.container():
+                st.markdown(f"#### {idx+1}. {video_data['title']}")
                 
-                # Step 1: Fetch video info
-                video_info = get_video_info(video_id, youtube_api_key_input)
-                if not video_info.get("success"):
-                    st.error(f"Error fetching video info: {video_info.get('error', 'Unknown error')}")
-                    continue
-                
-                # Display video info
-                st.subheader(f"📺 {video_info['title']}")
-                st.write(f"Channel: {video_info['channel']}")
-                st.write(f"View Count: {int(video_info['view_count']):,}")
-                
-                # Step 2: Download audio
-                audio_status = st.empty()
-                audio_status.info("Downloading audio...")
-                audio_result = download_youtube_audio(url)
-                
-                if not audio_result.get("success"):
-                    st.error(f"Error downloading audio: {audio_result.get('error', 'Unknown error')}")
-                    continue
-                
-                audio_status.success("✅ Audio downloaded successfully")
-                
-                # Step 3: Generate transcript with Whisper
-                transcript_status = st.empty()
-                transcript_status.info("Generating transcript with OpenAI Whisper...")
-                
-                transcript_result = transcribe_with_whisper(audio_result["file_path"], openai_api_key_input)
-                
-                if not transcript_result.get("success"):
-                    st.error(f"Error generating transcript: {transcript_result.get('error', 'Unknown error')}")
-                    continue
-                
-                transcript_status.success("✅ Transcript generated successfully")
-                
-                # Step 4: Fetch all comments
-                comment_status = st.empty()
-                comment_status.info("Fetching comments...")
-                
-                comments = get_all_comments_with_callback(video_id, youtube_api_key_input, status_text=comment_status)
-                
-                if not comments:
-                    comment_status.warning("No comments retrieved or comments are disabled for this video.")
-                    # Continue processing even if no comments are found
-                else:
-                    comment_status.success(f"✅ Fetched {len(comments):,} comments")
-                
-                # Step 5: Create Word document with transcript and comments
-                doc_status = st.empty()
-                doc_status.info("Creating Word document...")
-                
-                doc_result = create_word_doc(
-                    video_info, 
-                    transcript_result["transcript"], 
-                    comments
-                )
-                
-                if not doc_result.get("success"):
-                    st.error(f"Error creating document: {doc_result.get('error', 'Unknown error')}")
-                    continue
-                
-                doc_status.success("✅ Word document created successfully")
-                
-                # Create download link for the Word document
-                safe_title = clean_filename(video_info["title"])
+                # Create doc link
                 doc_link = get_binary_file_downloader_html(
-                    doc_result["file_path"], 
-                    f"{safe_title}_transcript_comments.docx"
+                    video_data["doc_path"], 
+                    f"Download Document"
                 )
-                
-                # Store processed video data in session state
-                st.session_state.processed_videos.append({
-                    "video_id": video_id,
-                    "title": video_info["title"],
-                    "safe_title": safe_title,
-                    "doc_path": doc_result["file_path"],
-                    "url": url
-                })
-                
                 st.markdown(doc_link, unsafe_allow_html=True)
                 
-                # Initialize session state for this video if not exists
-                video_state_key = f"video_state_{video_id}"
-                if video_state_key not in st.session_state:
-                    st.session_state[video_state_key] = {
-                        "analyzed": False,
-                        "analysis_result": None,
-                        "show_analysis": False
-                    }
-                
-                # Create a button for analysis instead of a checkbox
-                analyze_button_key = f"analyze_btn_{video_id}"
-                analyze_col, status_col = st.columns([1, 3])
-                
-                with analyze_col:
-                    if not st.session_state[video_state_key]["analyzed"]:
-                        if st.button("Analyze with ChatGPT", key=analyze_button_key):
-                            with status_col:
-                                analysis_status = st.empty()
-                                analysis_status.info("Analyzing video content with ChatGPT...")
-                                
-                                # Extract text from document
-                                doc_text = extract_text_from_docx(doc_result["file_path"])
-                                
-                                if doc_text:
-                                    # Analyze with ChatGPT
-                                    analysis_result = analyze_document_with_chatgpt(
-                                        doc_text, 
-                                        ANALYSIS_PROMPT, 
-                                        openai_api_key_input
-                                    )
-                                    
-                                    # Store in session state
-                                    st.session_state[video_state_key]["analyzed"] = True
-                                    st.session_state[video_state_key]["analysis_result"] = analysis_result
-                                    st.session_state[video_state_key]["show_analysis"] = True
-                                    
-                                    # Rerun to show results
-                                    st.experimental_rerun()
-                                else:
-                                    analysis_status.error("Could not extract text from document for analysis.")
-                    else:
-                        # Already analyzed, show toggle button
-                        if st.button("Show/Hide Analysis", key=f"toggle_{video_id}"):
-                            st.session_state[video_state_key]["show_analysis"] = not st.session_state[video_state_key]["show_analysis"]
-                            st.experimental_rerun()
-                
-                # Display analysis if available and show_analysis is True
-                if st.session_state[video_state_key]["analyzed"] and st.session_state[video_state_key]["show_analysis"]:
-                    analysis_result = st.session_state[video_state_key]["analysis_result"]
+                # Check if analysis already exists for this video
+                video_id = video_data["video_id"]
+                if video_id in st.session_state.analysis_results:
+                    analysis_result = st.session_state.analysis_results[video_id]
                     
-                    if analysis_result["success"]:
-                        status_col.success("✅ Analysis completed successfully")
-                        
-                        # Display the analysis in a nice format
+                    if "show" not in analysis_result:
+                        analysis_result["show"] = True
+                    
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        if st.button("Toggle Analysis", key=f"toggle_{video_id}"):
+                            analysis_result["show"] = not analysis_result["show"]
+                    
+                    with col2:
+                        st.success("✅ Analysis completed")
+                    
+                    if analysis_result["show"]:
                         st.subheader("ChatGPT Analysis")
-                        
                         with st.expander("View Analysis", expanded=True):
                             st.markdown(analysis_result["analysis"])
-                            
-                        # Create a download link for the analysis
-                        analysis_text = analysis_result["analysis"]
-                        analysis_filename = f"{safe_title}_analysis.txt"
                         
-                        # Save analysis to file
-                        analysis_path = f"downloads/{analysis_filename}"
-                        with open(analysis_path, "w", encoding="utf-8") as f:
-                            f.write(analysis_text)
-                            
-                        # Create download link
-                        analysis_link = get_binary_file_downloader_html(
-                            analysis_path,
-                            analysis_filename
+                        # Show download link if available
+                        if "analysis_path" in analysis_result:
+                            analysis_link = get_binary_file_downloader_html(
+                                analysis_result["analysis_path"],
+                                f"Download Analysis"
+                            )
+                            st.markdown(analysis_link, unsafe_allow_html=True)
+                else:
+                    # If currently analyzing this video
+                    if st.session_state.analyzing_video == idx:
+                        status_container = st.empty()
+                        status_container.info("Analyzing video content with ChatGPT... This may take a minute.")
+                        
+                        # Perform the analysis
+                        result = handle_analyze_document(
+                            video_data["video_id"],
+                            video_data["doc_path"],
+                            video_data["safe_title"]
                         )
                         
-                        st.markdown(analysis_link, unsafe_allow_html=True)
+                        # Store the result
+                        if result["success"]:
+                            st.session_state.analysis_results[video_id] = {
+                                "success": True,
+                                "analysis": result["analysis"],
+                                "analysis_path": result["analysis_path"],
+                                "analysis_filename": result["analysis_filename"],
+                                "show": True
+                            }
+                            status_container.success("✅ Analysis completed successfully")
+                            
+                            # Show the analysis
+                            st.subheader("ChatGPT Analysis")
+                            with st.expander("View Analysis", expanded=True):
+                                st.markdown(result["analysis"])
+                            
+                            # Show download link
+                            analysis_link = get_binary_file_downloader_html(
+                                result["analysis_path"],
+                                f"Download Analysis"
+                            )
+                            st.markdown(analysis_link, unsafe_allow_html=True)
+                        else:
+                            st.session_state.analysis_results[video_id] = {
+                                "success": False,
+                                "error": result["error"]
+                            }
+                            status_container.error(f"❌ Error analyzing content: {result['error']}")
+                        
+                        # Reset analyzing state
+                        st.session_state.analyzing_video = None
                     else:
-                        st.error(f"Error analyzing content: {analysis_result['error']}")
+                        # Show analyze button
+                        if st.button("Analyze with ChatGPT", key=f"analyze_{video_id}", on_click=on_analyze_click, args=(idx,)):
+                            # The actual analysis will happen on the next rerun, we just set the state here
+                            pass
                 
                 # Add a divider between videos
                 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
