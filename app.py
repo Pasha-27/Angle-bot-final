@@ -353,28 +353,130 @@ def extract_text_from_docx(docx_path):
         
 # Function to analyze document with OpenAI's ChatGPT
 def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
-    """Analyze document content using ChatGPT."""
+    """Analyze document content using ChatGPT with text chunking for long content."""
     try:
         import openai
         openai.api_key = api_key
         
-        # Combine the prompt and document text
-        full_prompt = f"{prompt_text}\n\nHere is the document containing the transcript and comments:\n\n{document_text}"
+        # Combine the prompt and truncated document text
+        total_text = document_text
         
-        # Make API call to ChatGPT
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo-16k",  # Using a model with larger context window
-            messages=[
-                {"role": "system", "content": "You are an expert analyst of YouTube video content and audience engagement."},
-                {"role": "user", "content": full_prompt}
-            ],
-            max_tokens=4000,
-            temperature=0.7
-        )
-        
-        # Extract and return the analysis
-        analysis = response.choices[0].message.content
-        return {"success": True, "analysis": analysis}
+        # If document is too long, we need to chunk it
+        # First, try GPT-4 as it has a larger context window
+        try:
+            # Try with GPT-4 (larger context window)
+            full_prompt = f"{prompt_text}\n\nHere is the document containing the transcript and comments:\n\n{total_text}"
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-4",  # Using GPT-4 for larger context
+                messages=[
+                    {"role": "system", "content": "You are an expert analyst of YouTube video content and audience engagement."},
+                    {"role": "user", "content": full_prompt}
+                ],
+                max_tokens=4000,
+                temperature=0.7
+            )
+            
+            analysis = response.choices[0].message.content
+            return {"success": True, "analysis": analysis}
+            
+        except Exception as e:
+            # If GPT-4 fails or is not available, try chunking with GPT-3.5
+            if "maximum context length" in str(e) or "not found" in str(e):
+                # Split the document into chunks
+                # Extract transcript and comments sections
+                if "## Transcript" in total_text and "## Comments" in total_text:
+                    # Split by sections
+                    parts = total_text.split("## Transcript", 1)
+                    header = parts[0]
+                    rest = "## Transcript" + parts[1]
+                    
+                    transcript_comments_parts = rest.split("## Comments", 1)
+                    transcript_section = transcript_comments_parts[0]
+                    comments_section = "## Comments" + transcript_comments_parts[1]
+                    
+                    # First, analyze the transcript
+                    transcript_prompt = f"{prompt_text}\n\nHere is the TRANSCRIPT ONLY from the YouTube video:\n\n{header}\n{transcript_section}\n\nPlease analyze the transcript content. I will provide the comments separately."
+                    
+                    transcript_response = openai.ChatCompletion.create(
+                        model="gpt-3.5-turbo-16k",
+                        messages=[
+                            {"role": "system", "content": "You are an expert analyst of YouTube video content."},
+                            {"role": "user", "content": transcript_prompt}
+                        ],
+                        max_tokens=2000,
+                        temperature=0.7
+                    )
+                    
+                    transcript_analysis = transcript_response.choices[0].message.content
+                    
+                    # Now, analyze a sample of comments
+                    # Extract some representative comments (first few, some middle, some end)
+                    comment_lines = comments_section.split('\n')
+                    # Take about 200 lines max spread throughout the comments
+                    if len(comment_lines) > 200:
+                        sample_comments = '\n'.join(
+                            comment_lines[:50] +  # First 50 lines
+                            comment_lines[len(comment_lines)//2-25:len(comment_lines)//2+25] +  # Middle 50 lines
+                            comment_lines[-50:]  # Last 50 lines
+                        )
+                    else:
+                        sample_comments = comments_section
+                    
+                    comments_prompt = f"{prompt_text}\n\nHere is a SAMPLE OF COMMENTS from the YouTube video (transcript already analyzed separately):\n\n{sample_comments}\n\nPlease analyze these comments and identify patterns, reactions, and viewer sentiment."
+                    
+                    comments_response = openai.ChatCompletion.create(
+                        model="gpt-3.5-turbo-16k",
+                        messages=[
+                            {"role": "system", "content": "You are an expert analyst of audience engagement and comments."},
+                            {"role": "user", "content": comments_prompt}
+                        ],
+                        max_tokens=2000,
+                        temperature=0.7
+                    )
+                    
+                    comments_analysis = comments_response.choices[0].message.content
+                    
+                    # Final synthesis
+                    synthesis_prompt = f"Based on the following separate analyses of a YouTube video's transcript and comments, provide a comprehensive analysis that integrates both perspectives:\n\n1. TRANSCRIPT ANALYSIS:\n{transcript_analysis}\n\n2. COMMENTS ANALYSIS:\n{comments_analysis}\n\nPlease synthesize these into a cohesive overall analysis."
+                    
+                    synthesis_response = openai.ChatCompletion.create(
+                        model="gpt-3.5-turbo-16k",
+                        messages=[
+                            {"role": "system", "content": "You are an expert analyst of YouTube video content and audience engagement."},
+                            {"role": "user", "content": synthesis_prompt}
+                        ],
+                        max_tokens=2000,
+                        temperature=0.7
+                    )
+                    
+                    final_analysis = synthesis_response.choices[0].message.content
+                    return {"success": True, "analysis": final_analysis}
+                else:
+                    # Fallback if we can't identify sections clearly
+                    # Just truncate the document to fit
+                    # Rough estimate: 1 token ≈ 4 chars
+                    max_chars = 14000 * 4  # Leave room for prompt
+                    truncated_text = total_text[:max_chars] + "\n...[Content truncated due to length]..."
+                    
+                    truncated_prompt = f"{prompt_text}\n\nHere is a truncated version of the document (it was too long for complete analysis):\n\n{truncated_text}"
+                    
+                    truncated_response = openai.ChatCompletion.create(
+                        model="gpt-3.5-turbo-16k",
+                        messages=[
+                            {"role": "system", "content": "You are an expert analyst of YouTube video content and audience engagement."},
+                            {"role": "user", "content": truncated_prompt}
+                        ],
+                        max_tokens=2000,
+                        temperature=0.7
+                    )
+                    
+                    truncated_analysis = truncated_response.choices[0].message.content
+                    return {"success": True, "analysis": truncated_analysis + "\n\n[Note: This analysis is based on a truncated version of the document as the full content exceeded the model's context limits.]"}
+            else:
+                # If it's a different error, raise it
+                raise e
+                
     except Exception as e:
         return {"success": False, "error": f"Error analyzing document with ChatGPT: {str(e)}"}
 
