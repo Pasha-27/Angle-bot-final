@@ -14,6 +14,8 @@ from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 import docx2txt
+from pydub import AudioSegment  # New import for audio chunking
+import io
 
 # Configure page settings
 st.set_page_config(
@@ -329,16 +331,51 @@ def download_youtube_audio(youtube_url, output_path="./downloads", format="mp3",
 
 # Function to transcribe audio using OpenAI's Whisper
 def transcribe_with_whisper(audio_file_path, api_key):
-    """Convert audio to text using OpenAI's Whisper API."""
+    """Convert audio to text using OpenAI's Whisper API.
+    If the audio file size exceeds 25MB, break it into smaller chunks (up to 5 minutes per chunk)
+    and transcribe each chunk sequentially."""
     try:
         import openai
         openai.api_key = api_key
+
+        size_limit = 25 * 1024 * 1024  # 25 MB in bytes
+        file_size = os.path.getsize(audio_file_path)
         
-        with open(audio_file_path, "rb") as audio_file:
-            transcript_response = openai.Audio.transcribe("whisper-1", audio_file)
+        # If file size is within the limit, transcribe normally.
+        if file_size <= size_limit:
+            with open(audio_file_path, "rb") as audio_file:
+                transcript_response = openai.Audio.transcribe("whisper-1", audio_file)
+            transcript_text = transcript_response.get("text", "")
+            return {"success": True, "transcript": transcript_text}
+        else:
+            st.info("Audio file is larger than 25MB. Splitting into smaller chunks for transcription...")
+            # Determine file extension for pydub
+            ext = os.path.splitext(audio_file_path)[1][1:]
+            # Load audio with pydub
+            audio = AudioSegment.from_file(audio_file_path, format=ext)
+            duration_ms = len(audio)
+            # Calculate average bytes per ms from the original file
+            avg_bytes_per_ms = file_size / duration_ms
+            # Maximum chunk duration in ms so that the chunk size is under the 25MB limit
+            max_chunk_duration_ms = int(size_limit / avg_bytes_per_ms)
+            # To optimize API usage, cap chunk duration at 5 minutes (300000 ms)
+            chunk_duration_ms = min(max_chunk_duration_ms, 5 * 60 * 1000)
             
-        transcript_text = transcript_response.get("text", "")
-        return {"success": True, "transcript": transcript_text}
+            transcript_text = ""
+            num_chunks = (duration_ms // chunk_duration_ms) + (1 if duration_ms % chunk_duration_ms != 0 else 0)
+            st.write(f"Processing {num_chunks} chunk(s) ...")
+            for i in range(0, duration_ms, chunk_duration_ms):
+                chunk = audio[i: i + chunk_duration_ms]
+                buf = io.BytesIO()
+                # Export chunk to a BytesIO object in mp3 format
+                chunk.export(buf, format="mp3")
+                buf.seek(0)
+                
+                st.write(f"Transcribing chunk {(i // chunk_duration_ms) + 1} of {num_chunks} ...")
+                result = openai.Audio.transcribe("whisper-1", buf)
+                chunk_text = result.get("text", "")
+                transcript_text += chunk_text + " "
+            return {"success": True, "transcript": transcript_text}
     except Exception as e:
         return {"success": False, "error": f"Error transcribing audio with OpenAI: {str(e)}"}
         
