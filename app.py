@@ -369,6 +369,8 @@ def transcribe_with_whisper(audio_file_path, api_key):
                 buf = io.BytesIO()
                 # Export chunk to a BytesIO object in mp3 format
                 chunk.export(buf, format="mp3")
+                # Set a name attribute so that the file-like object is accepted by the API
+                buf.name = "chunk.mp3"
                 buf.seek(0)
                 
                 st.write(f"Transcribing chunk {(i // chunk_duration_ms) + 1} of {num_chunks} ...")
