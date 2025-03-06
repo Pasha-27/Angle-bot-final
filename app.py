@@ -311,7 +311,6 @@ def transcribe_with_whisper(audio_file_path, api_key):
 # Document Analysis Functions
 # --------------------------
 
-# Function to extract text from DOCX file
 def extract_text_from_docx(docx_path):
     try:
         return docx2txt.process(docx_path)
@@ -319,7 +318,6 @@ def extract_text_from_docx(docx_path):
         st.error(f"Error extracting text from document: {str(e)}")
         return None
 
-# Updated analysis function using GPT-4 with chunking and synthesis
 def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
     try:
         import openai
@@ -560,24 +558,27 @@ with tab2:
                 video_id = video_data["video_id"]
                 if video_id in st.session_state.analysis_results:
                     analysis_result = st.session_state.analysis_results[video_id]
-                    if "show" not in analysis_result:
-                        analysis_result["show"] = True
-                    col1, col2 = st.columns([1, 3])
-                    with col1:
-                        if st.button("Toggle Analysis", key=f"toggle_{video_id}"):
-                            analysis_result["show"] = not analysis_result["show"]
-                    with col2:
-                        st.success("✅ Analysis completed")
-                    if analysis_result["show"]:
-                        st.subheader("ChatGPT Analysis")
-                        with st.expander("View Analysis", expanded=True):
-                            st.markdown(analysis_result["analysis"])
-                        if "analysis_path" in analysis_result:
-                            analysis_link = get_binary_file_downloader_html(
-                                analysis_result["analysis_path"],
-                                f"Download Analysis"
-                            )
-                            st.markdown(analysis_link, unsafe_allow_html=True)
+                    if analysis_result.get("success", False):
+                        if "show" not in analysis_result:
+                            analysis_result["show"] = True
+                        col1, col2 = st.columns([1, 3])
+                        with col1:
+                            if st.button("Toggle Analysis", key=f"toggle_{video_id}"):
+                                analysis_result["show"] = not analysis_result["show"]
+                        with col2:
+                            st.success("✅ Analysis completed")
+                        if analysis_result["show"]:
+                            st.subheader("ChatGPT Analysis")
+                            with st.expander("View Analysis", expanded=True):
+                                st.markdown(analysis_result["analysis"])
+                            if "analysis_path" in analysis_result:
+                                analysis_link = get_binary_file_downloader_html(
+                                    analysis_result["analysis_path"],
+                                    f"Download Analysis"
+                                )
+                                st.markdown(analysis_link, unsafe_allow_html=True)
+                    else:
+                        st.error("Error in analysis: " + analysis_result.get("error", "Unknown error"))
                 else:
                     if st.session_state.analyzing_video == idx:
                         status_container = st.empty()
@@ -609,7 +610,7 @@ with tab2:
                                 "success": False,
                                 "error": result["error"]
                             }
-                            status_container.error(f"❌ Error analyzing content: {result['error']}")
+                            status_container.error("❌ Error analyzing content: " + result.get("error", "Unknown error"))
                         st.session_state.analyzing_video = None
                     else:
                         if st.button("Analyze with ChatGPT", key=f"analyze_{video_id}", on_click=on_analyze_click, args=(idx,)):
