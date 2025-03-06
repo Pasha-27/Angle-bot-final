@@ -56,7 +56,7 @@ OPENAI_API_KEY = api_keys["openai_api_key"]
 # Create downloads directory if it doesn't exist
 os.makedirs("downloads", exist_ok=True)
 
-# Load angle_bot_prompt.txt
+# Load analysis prompt from file or use default prompt
 def load_analysis_prompt():
     try:
         with open("angle_bot_prompt.txt", "r", encoding="utf-8") as f:
@@ -70,68 +70,26 @@ ANALYSIS_PROMPT = load_analysis_prompt()
 # Apply custom CSS for dark mode and modern UI
 st.markdown("""
 <style>
-    /* Dark mode theme */
-    .stApp {
-        background-color: #121212;
-        color: #f0f0f0;
-    }
-    /* Card-like containers */
-    .card {
-        background-color: #1e1e1e;
-        border-radius: 10px;
-        padding: 20px;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    /* Header styling */
-    h1, h2, h3 {
-        color: #ffffff;
-        font-weight: 600;
-    }
-    /* Accent colors for highlights */
-    .highlight {
-        color: #ff5252;
-    }
-    /* Button hover effects */
-    .stButton>button:hover {
-        background-color: #ff5252;
-        border-color: #ff5252;
-    }
-    /* Progress bar styling */
-    .stProgress > div > div {
-        background-color: #ff5252;
-    }
-    /* Custom divider */
-    .divider {
-        height: 3px;
-        background: linear-gradient(90deg, #ff5252, transparent);
-        margin: 20px 0;
-        border-radius: 10px;
-    }
-    /* Download button styling */
-    .download-button {
-        display: inline-block;
-        background-color: #ff5252;
-        color: white;
-        padding: 8px 16px;
-        border-radius: 4px;
-        text-decoration: none;
-        font-weight: bold;
-        margin: 10px 0;
-        transition: background-color 0.3s;
-    }
-    .download-button:hover {
-        background-color: #ff3333;
-    }
+    .stApp { background-color: #121212; color: #f0f0f0; }
+    .card { background-color: #1e1e1e; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+    h1, h2, h3 { color: #ffffff; font-weight: 600; }
+    .highlight { color: #ff5252; }
+    .stButton>button:hover { background-color: #ff5252; border-color: #ff5252; }
+    .stProgress > div > div { background-color: #ff5252; }
+    .divider { height: 3px; background: linear-gradient(90deg, #ff5252, transparent); margin: 20px 0; border-radius: 10px; }
+    .download-button { display: inline-block; background-color: #ff5252; color: white; padding: 8px 16px; border-radius: 4px; text-decoration: none; font-weight: bold; margin: 10px 0; transition: background-color 0.3s; }
+    .download-button:hover { background-color: #ff3333; }
 </style>
 """, unsafe_allow_html=True)
 
-# Helper function to remove invalid filename characters
+# --------------------------
+# Helper Functions
+# --------------------------
+
 def clean_filename(filename: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', "_", filename)
     return cleaned.strip('. ')[:100]
 
-# Helper function: extract video ID from a YouTube URL
 def extract_video_id(url: str) -> Optional[str]:
     patterns = [
         r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
@@ -144,15 +102,12 @@ def extract_video_id(url: str) -> Optional[str]:
             return match.group(1)
     return None
 
-# Helper function: get binary file download link
 def get_binary_file_downloader_html(bin_file, file_label='File'):
-    """Generate a link to download a binary file."""
     with open(bin_file, 'rb') as f:
         data = f.read()
     bin_str = base64.b64encode(data).decode()
     return f'<a href="data:application/octet-stream;base64,{bin_str}" download="{os.path.basename(bin_file)}" class="download-button">{file_label}</a>'
 
-# Helper function: fetch comments for a video using the YouTube Data API v3
 def get_comments(video_id: str, api_key: str, page_token: Optional[str] = None) -> Dict:
     api_url = "https://www.googleapis.com/youtube/v3/commentThreads"
     params = {
@@ -184,7 +139,6 @@ def get_comments(video_id: str, api_key: str, page_token: Optional[str] = None) 
     except Exception as e:
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
-# Helper function: process comment data from the API response
 def process_comment_data(data: Dict) -> Tuple[List[Dict], Optional[str]]:
     comments = []
     for item in data.get("items", []):
@@ -209,7 +163,6 @@ def process_comment_data(data: Dict) -> Tuple[List[Dict], Optional[str]]:
     next_page_token = data.get("nextPageToken")
     return comments, next_page_token
 
-# Helper function: format API timestamps to a readable date
 def format_timestamp(timestamp: str) -> str:
     try:
         dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
@@ -217,7 +170,6 @@ def format_timestamp(timestamp: str) -> str:
     except Exception:
         return timestamp
 
-# Helper function: get basic video information
 def get_video_info(video_id: str, api_key: str) -> Dict:
     api_url = "https://www.googleapis.com/youtube/v3/videos"
     params = {
@@ -245,7 +197,6 @@ def get_video_info(video_id: str, api_key: str) -> Dict:
         "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", "")
     }
 
-# Helper function: fetch all comments with pagination
 def get_all_comments_with_callback(video_id: str, api_key: str, status_text=None) -> List[Dict]:
     all_comments = []
     next_page_token = None
@@ -274,22 +225,21 @@ def get_all_comments_with_callback(video_id: str, api_key: str, status_text=None
         page_num += 1
     return all_comments
 
-# Function to download audio from a YouTube video
+# --------------------------
+# File Handling Functions
+# --------------------------
+
 def download_youtube_audio(youtube_url, output_path="./downloads", format="mp3", quality="192"):
-    """Download audio from a YouTube video using yt-dlp."""
     try:
         video_id = extract_video_id(youtube_url)
         if not video_id:
             return {"success": False, "error": "Could not extract video ID from URL"}
-            
         video_info = get_video_info(video_id, YOUTUBE_API_KEY)
         if not video_info["success"]:
             return video_info
-            
         title = video_info["title"]
         base_filename = clean_filename(title)
         output_file = f"{output_path}/{base_filename}.{format}"
-        
         command = [
             "yt-dlp", "-f", "bestaudio",
             "--extract-audio", "--audio-format", format,
@@ -298,26 +248,20 @@ def download_youtube_audio(youtube_url, output_path="./downloads", format="mp3",
             "--no-playlist", "--quiet", "--progress",
             youtube_url
         ]
-        
         progress_bar = st.progress(0)
         status_text = st.empty()
         status_text.text("Downloading audio...")
-        
         process = subprocess.run(command, capture_output=True, text=True)
-        
         if process.returncode != 0:
             return {"success": False, "error": process.stderr}
-            
         progress_bar.progress(100)
         status_text.empty()
-        
         if not os.path.exists(output_file):
             potential_files = list(Path(output_path).glob(f"{base_filename}.*"))
             if potential_files:
                 output_file = str(potential_files[0])
             else:
                 return {"success": False, "error": "File not found after download"}
-                
         return {
             "success": True,
             "file_path": output_file,
@@ -327,19 +271,12 @@ def download_youtube_audio(youtube_url, output_path="./downloads", format="mp3",
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# Function to transcribe audio using OpenAI's Whisper
 def transcribe_with_whisper(audio_file_path, api_key):
-    """Convert audio to text using OpenAI's Whisper API.
-    If the audio file size exceeds 25MB, break it into smaller chunks (up to 5 minutes per chunk)
-    and transcribe each chunk sequentially."""
     try:
         import openai
         openai.api_key = api_key
-
-        size_limit = 25 * 1024 * 1024  # 25 MB in bytes
+        size_limit = 25 * 1024 * 1024  # 25 MB
         file_size = os.path.getsize(audio_file_path)
-        
-        # If file size is within the limit, transcribe normally.
         if file_size <= size_limit:
             with open(audio_file_path, "rb") as audio_file:
                 transcript_response = openai.Audio.transcribe("whisper-1", audio_file)
@@ -352,9 +289,7 @@ def transcribe_with_whisper(audio_file_path, api_key):
             duration_ms = len(audio)
             avg_bytes_per_ms = file_size / duration_ms
             max_chunk_duration_ms = int(size_limit / avg_bytes_per_ms)
-            # Cap each chunk to 5 minutes (300000 ms) for efficiency
             chunk_duration_ms = min(max_chunk_duration_ms, 5 * 60 * 1000)
-            
             transcript_text = ""
             num_chunks = (duration_ms // chunk_duration_ms) + (1 if duration_ms % chunk_duration_ms != 0 else 0)
             st.write(f"Processing {num_chunks} chunk(s) ...")
@@ -362,9 +297,8 @@ def transcribe_with_whisper(audio_file_path, api_key):
                 chunk = audio[i: i + chunk_duration_ms]
                 buf = io.BytesIO()
                 chunk.export(buf, format="mp3")
-                buf.name = "chunk.mp3"  # Set name attribute for API compatibility
+                buf.name = "chunk.mp3"
                 buf.seek(0)
-                
                 st.write(f"Transcribing chunk {(i // chunk_duration_ms) + 1} of {num_chunks} ...")
                 result = openai.Audio.transcribe("whisper-1", buf)
                 chunk_text = result.get("text", "")
@@ -373,19 +307,24 @@ def transcribe_with_whisper(audio_file_path, api_key):
     except Exception as e:
         return {"success": False, "error": f"Error transcribing audio with OpenAI: {str(e)}"}
 
-# Updated function to analyze document with GPT-4 using chunking and synthesis
+# --------------------------
+# Document Analysis Functions
+# --------------------------
+
+# Function to extract text from DOCX file
+def extract_text_from_docx(docx_path):
+    try:
+        return docx2txt.process(docx_path)
+    except Exception as e:
+        st.error(f"Error extracting text from document: {str(e)}")
+        return None
+
+# Updated analysis function using GPT-4 with chunking and synthesis
 def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
-    """Analyze document content using GPT-4.
-    If the document is too long, split it into chunks, summarize each chunk with GPT-4,
-    and then synthesize the summaries into a final analysis."""
     try:
         import openai
         openai.api_key = api_key
-
-        # Set a maximum input size (in characters) for each chunk.
-        # This is an approximation; adjust as needed based on your context window.
-        max_chunk_length = 12000  # approximately 12K characters per chunk
-        
+        max_chunk_length = 12000  # Approximate character limit per chunk
         if len(document_text) <= max_chunk_length:
             full_prompt = f"{prompt_text}\n\nHere is the document containing the transcript and comments:\n\n{document_text}"
             response = openai.ChatCompletion.create(
@@ -400,11 +339,10 @@ def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
             analysis = response.choices[0].message.content
             return {"success": True, "analysis": analysis}
         else:
-            # Split the document into manageable chunks.
             chunks = [document_text[i:i+max_chunk_length] for i in range(0, len(document_text), max_chunk_length)]
             chunk_summaries = []
             for idx, chunk in enumerate(chunks):
-                chunk_prompt = f"{prompt_text}\n\nHere is a portion ({idx+1}/{len(chunks)}) of the document:\n\n{chunk}\n\nPlease summarize the key points, themes, and insights from this section."
+                chunk_prompt = f"{prompt_text}\n\nHere is portion {idx+1} of {len(chunks)} of the document:\n\n{chunk}\n\nPlease summarize the key points and insights from this section."
                 response = openai.ChatCompletion.create(
                     model="gpt-4",
                     messages=[
@@ -416,11 +354,10 @@ def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
                 )
                 chunk_summary = response.choices[0].message.content
                 chunk_summaries.append(chunk_summary)
-            # Synthesize the chunk summaries into a final analysis.
-            synthesis_prompt = f"{prompt_text}\n\nBased on the following summaries of different sections of the document, provide a comprehensive analysis that integrates all the insights:\n\n"
+            synthesis_prompt = f"{prompt_text}\n\nBased on the following summaries, provide a comprehensive analysis:\n\n"
             for i, summary in enumerate(chunk_summaries):
                 synthesis_prompt += f"Summary {i+1}:\n{summary}\n\n"
-            synthesis_prompt += "\nPlease synthesize these into a cohesive overall analysis."
+            synthesis_prompt += "Please synthesize these into a cohesive overall analysis."
             synthesis_response = openai.ChatCompletion.create(
                 model="gpt-4",
                 messages=[
@@ -435,9 +372,7 @@ def analyze_document_with_chatgpt(document_text, prompt_text, api_key):
     except Exception as e:
         return {"success": False, "error": f"Error analyzing document with ChatGPT: {str(e)}"}
 
-# Function to create a Word document with transcript and comments
 def create_word_doc(video_info, transcript, comments, output_path="./downloads"):
-    """Create a Word document with the video transcript and comments."""
     try:
         doc = Document()
         title = doc.add_heading(f"{video_info['title']}", level=1)
@@ -465,7 +400,6 @@ def create_word_doc(video_info, transcript, comments, output_path="./downloads")
     except Exception as e:
         return {"success": False, "error": f"Error creating Word document: {str(e)}"}
 
-# Function to handle the analysis of a document
 def handle_analyze_document(video_id, doc_path, safe_title):
     try:
         doc_text = extract_text_from_docx(doc_path)
@@ -493,11 +427,13 @@ def handle_analyze_document(video_id, doc_path, safe_title):
     except Exception as e:
         return {"success": False, "error": f"Error during analysis: {str(e)}"}
 
+# --------------------------
 # Main Application UI
+# --------------------------
+
 st.markdown('<h1 class="highlight">YouTube Comments & Transcript Downloader</h1>', unsafe_allow_html=True)
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
-# API Key Input Section
 with st.expander("API Keys (Required)", expanded=not (YOUTUBE_API_KEY and OPENAI_API_KEY)):
     col1, col2 = st.columns(2)
     with col1:
@@ -521,7 +457,6 @@ with st.expander("API Keys (Required)", expanded=not (YOUTUBE_API_KEY and OPENAI
     if not openai_api_key_input:
         st.warning("⚠️ OpenAI API key is required for transcription and analysis.")
 
-# Create tabs for different sections of the app
 tab1, tab2 = st.tabs(["Process Videos", "Analyze Videos"])
 
 with tab1:
