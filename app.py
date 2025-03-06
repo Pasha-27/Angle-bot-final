@@ -16,6 +16,7 @@ from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 import docx2txt
 from pydub import AudioSegment  # For audio chunking
 import io
+import concurrent.futures  # For running analysis in a background thread
 
 # Configure page settings
 st.set_page_config(
@@ -543,6 +544,7 @@ with tab1:
 with tab2:
     def on_analyze_click(video_idx):
         st.session_state.analyzing_video = video_idx
+
     if not st.session_state.processed_videos:
         st.info("No videos have been processed yet. Please go to the 'Process Videos' tab to process videos first.")
     else:
@@ -583,11 +585,18 @@ with tab2:
                     if st.session_state.analyzing_video == idx:
                         status_container = st.empty()
                         status_container.info("Analyzing video content with ChatGPT... This may take a minute.")
-                        result = handle_analyze_document(
-                            video_data["video_id"],
-                            video_data["doc_path"],
-                            video_data["safe_title"]
-                        )
+                        progress_bar = st.progress(0)
+                        # Run analysis in a background thread while updating the progress bar
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(handle_analyze_document, video_data["video_id"], video_data["doc_path"], video_data["safe_title"])
+                            progress = 0
+                            # Simulate progress until the analysis completes
+                            while not future.done():
+                                progress = min(progress + 5, 95)
+                                progress_bar.progress(progress)
+                                time.sleep(2)
+                            result = future.result()
+                            progress_bar.progress(100)
                         if result["success"]:
                             st.session_state.analysis_results[video_id] = {
                                 "success": True,
